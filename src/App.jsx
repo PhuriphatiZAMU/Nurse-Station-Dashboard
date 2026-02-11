@@ -11,6 +11,7 @@ import {
   Volume2,
   VolumeX
 } from 'lucide-react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 
 // --- Firebase Configuration ---
 const DATABASE_URL = import.meta.env.VITE_DATABASE_URL || "https://preserving-fall-detector-default-rtdb.firebaseio.com";
@@ -755,6 +756,7 @@ const App = () => {
           </div>
         </div>
       </footer>
+      <SpeedInsights />
     </div>
   );
 };
