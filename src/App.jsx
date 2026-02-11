@@ -757,6 +757,7 @@ const App = () => {
         </div>
       </footer>
 
+
       <SpeedInsights />
     </div>
   );
