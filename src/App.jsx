@@ -86,7 +86,7 @@ class AlarmSound {
           this.fallbackAudio.pause();
           this.fallbackAudio.currentTime = 0;
           this.fallbackAudio.volume = 1;
-        } catch (e) { /* ไม่เป็นไร */ }
+        } catch (_e) { /* ไม่เป็นไร */ }
       }
 
       this.isUnlocked = true;
@@ -234,7 +234,7 @@ class AlarmSound {
       this.fallbackAudio.volume = 1;
       const p = this.fallbackAudio.play();
       if (p) p.catch(() => { }); // ignore autoplay errors
-    } catch (e) { /* ignore */ }
+    } catch (_e) { /* ignore */ }
   }
 
   stop() {
@@ -251,7 +251,7 @@ class AlarmSound {
       try {
         this.fallbackAudio.pause();
         this.fallbackAudio.currentTime = 0;
-      } catch (e) { /* ignore */ }
+      } catch (_e) { /* ignore */ }
     }
   }
 
