@@ -724,6 +724,70 @@ body {
   background-color: rgba(239, 68, 68, 0.2);
 }
 
+/* Audio status indicator */
+.settings-btn {
+  position: relative;
+}
+
+.settings-btn.audio-locked {
+  color: var(--slate-500);
+}
+
+@keyframes badge-pulse {
+
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.2);
+  }
+}
+
+.audio-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 14px;
+  height: 14px;
+  background: #f59e0b;
+  color: #000;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 50%;
+  animation: badge-pulse 1.5s ease-in-out infinite;
+}
+
+/* Audio unlock prompt banner (Mobile) */
+.audio-unlock-banner {
+  max-width: 80rem;
+  margin: 0 auto var(--space-4);
+  padding: 0.625rem 1rem;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(99, 102, 241, 0.15));
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: var(--radius-xl);
+  color: var(--blue-500);
+  font-size: 0.875rem;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  justify-content: center;
+  transition: all var(--transition-fast);
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+.audio-unlock-banner:hover,
+.audio-unlock-banner:active {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.25), rgba(99, 102, 241, 0.25));
+  border-color: rgba(59, 130, 246, 0.5);
+}
+
 /* Emergency Banner */
 .emergency-banner {
   max-width: 80rem;

@@ -16,81 +16,252 @@ import {
 const DATABASE_URL = import.meta.env.VITE_DATABASE_URL || "https://preserving-fall-detector-default-rtdb.firebaseio.com";
 const DATABASE_SECRET = import.meta.env.VITE_DATABASE_SECRET || "";
 
-// --- Alarm Sound System (Web Audio API) ---
+// --- Alarm Sound System (Mobile-compatible) ---
+// ใช้ทั้ง Web Audio API + HTML5 Audio fallback
+// Pre-unlock audio ตั้งแต่ผู้ใช้ click/tap ครั้งแรก
+
 class AlarmSound {
   constructor() {
     this.audioCtx = null;
     this.intervalId = null;
     this.isPlaying = false;
+    this.isUnlocked = false;
+    this.alarmBuffer = null;
+    this.fallbackAudio = null;
+    this._onUnlock = null;
   }
 
-  _getContext() {
-    if (!this.audioCtx) {
-      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume();
-    }
-    return this.audioCtx;
+  // เรียกครั้งเดียวตอน mount — ผูก event listener สำหรับ unlock
+  init(onUnlockCallback) {
+    this._onUnlock = onUnlockCallback;
+
+    // สร้าง fallback HTML5 Audio (ทำงานได้บน iOS/Android ที่บล็อก Web Audio)
+    this._createFallbackAudio();
+
+    // ดักจับ user interaction แรกเพื่อ unlock audio
+    const unlockHandler = () => {
+      this._unlock();
+      // ลบ listener หลัง unlock สำเร็จ
+      ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
+        document.removeEventListener(evt, unlockHandler, { capture: true });
+      });
+    };
+
+    ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
+      document.addEventListener(evt, unlockHandler, { capture: true, passive: true });
+    });
   }
 
-  _playBeep(frequency, duration, startTime) {
-    const ctx = this._getContext();
-    const oscillator = ctx.createOscillator();
-    const gainNode = ctx.createGain();
+  // Unlock AudioContext + pre-generate alarm buffer
+  async _unlock() {
+    try {
+      // สร้าง AudioContext
+      if (!this.audioCtx) {
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
 
-    oscillator.connect(gainNode);
-    gainNode.connect(ctx.destination);
+      // Resume ถ้า suspended (จำเป็นสำหรับ mobile)
+      if (this.audioCtx.state === 'suspended') {
+        await this.audioCtx.resume();
+      }
 
-    oscillator.type = 'sine';
-    oscillator.frequency.setValueAtTime(frequency, startTime);
+      // เล่นเสียงเงียบเพื่อ unlock (iOS ต้องการ)
+      const silentOsc = this.audioCtx.createOscillator();
+      const silentGain = this.audioCtx.createGain();
+      silentGain.gain.setValueAtTime(0, this.audioCtx.currentTime);
+      silentOsc.connect(silentGain);
+      silentGain.connect(this.audioCtx.destination);
+      silentOsc.start();
+      silentOsc.stop(this.audioCtx.currentTime + 0.01);
 
-    // Envelope: quick attack, sustain, quick release
-    gainNode.gain.setValueAtTime(0, startTime);
-    gainNode.gain.linearRampToValueAtTime(0.6, startTime + 0.02);
-    gainNode.gain.setValueAtTime(0.6, startTime + duration - 0.05);
-    gainNode.gain.linearRampToValueAtTime(0, startTime + duration);
+      // Pre-generate alarm buffer เพื่อให้เล่นได้ทันที
+      this._generateAlarmBuffer();
 
-    oscillator.start(startTime);
-    oscillator.stop(startTime + duration);
+      // Unlock fallback audio ด้วย
+      if (this.fallbackAudio) {
+        try {
+          this.fallbackAudio.volume = 0;
+          await this.fallbackAudio.play();
+          this.fallbackAudio.pause();
+          this.fallbackAudio.currentTime = 0;
+          this.fallbackAudio.volume = 1;
+        } catch (e) { /* ไม่เป็นไร */ }
+      }
+
+      this.isUnlocked = true;
+      console.log('🔓 Audio unlocked — alarm ready');
+
+      if (this._onUnlock) {
+        this._onUnlock(true);
+      }
+    } catch (e) {
+      console.error('Audio unlock failed:', e);
+    }
+  }
+
+  // สร้าง alarm WAV buffer ล่วงหน้า (เล่นได้ทันทีไม่ต้อง synthesize)
+  _generateAlarmBuffer() {
+    if (!this.audioCtx) return;
+
+    const sampleRate = this.audioCtx.sampleRate;
+    const duration = 1.8; // ความยาว 1 รอบ
+    const length = sampleRate * duration;
+    const buffer = this.audioCtx.createBuffer(1, length, sampleRate);
+    const channel = buffer.getChannelData(0);
+
+    // สร้างเสียง siren: สลับ 880Hz กับ 660Hz ทุก 0.2 วินาที
+    for (let i = 0; i < length; i++) {
+      const t = i / sampleRate;
+      const cyclePos = t % 0.4; // 0.4s per high-low cycle
+      const freq = cyclePos < 0.2 ? 880 : 660;
+
+      // Square wave (ดังกว่า sine wave)
+      const wave = Math.sin(2 * Math.PI * freq * t) > 0 ? 0.7 : -0.7;
+
+      // Envelope ต่อ beep (ตัด click)
+      const beepPos = t % 0.2;
+      let envelope = 1;
+      if (beepPos < 0.005) envelope = beepPos / 0.005; // attack 5ms
+      if (beepPos > 0.18) envelope = (0.2 - beepPos) / 0.02; // release 20ms
+
+      // Pause ช่วงท้าย
+      if (t > 1.6) envelope *= (duration - t) / 0.2;
+
+      channel[i] = wave * envelope;
+    }
+
+    this.alarmBuffer = buffer;
+  }
+
+  // สร้าง HTML5 Audio fallback (ใช้ data URI — ไม่ต้องโหลดไฟล์)
+  _createFallbackAudio() {
+    try {
+      // สร้าง WAV ง่ายๆ แบบ PCM
+      const sampleRate = 22050;
+      const duration = 1.8;
+      const numSamples = Math.floor(sampleRate * duration);
+      const dataSize = numSamples * 2; // 16-bit
+      const headerSize = 44;
+      const buffer = new ArrayBuffer(headerSize + dataSize);
+      const view = new DataView(buffer);
+
+      // WAV header
+      const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeStr(36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      // Generate alarm tones
+      for (let i = 0; i < numSamples; i++) {
+        const t = i / sampleRate;
+        const cyclePos = t % 0.4;
+        const freq = cyclePos < 0.2 ? 880 : 660;
+        const wave = Math.sin(2 * Math.PI * freq * t) > 0 ? 0.6 : -0.6;
+
+        let envelope = 1;
+        const beepPos = t % 0.2;
+        if (beepPos < 0.005) envelope = beepPos / 0.005;
+        if (beepPos > 0.18) envelope = (0.2 - beepPos) / 0.02;
+        if (t > 1.6) envelope *= (duration - t) / 0.2;
+
+        const sample = Math.max(-1, Math.min(1, wave * envelope));
+        view.setInt16(headerSize + i * 2, sample * 32767, true);
+      }
+
+      // แปลงเป็น base64 data URI
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const dataUri = 'data:audio/wav;base64,' + btoa(binary);
+
+      this.fallbackAudio = new Audio(dataUri);
+      this.fallbackAudio.loop = true;
+      this.fallbackAudio.preload = 'auto';
+    } catch (e) {
+      console.error('Fallback audio creation failed:', e);
+    }
   }
 
   play() {
     if (this.isPlaying) return;
     this.isPlaying = true;
+    console.log('🔊 Alarm playing...');
 
-    const playCycle = () => {
-      try {
-        const ctx = this._getContext();
-        const now = ctx.currentTime;
-        // Two-tone siren: high → low → high → low
-        this._playBeep(800, 0.25, now);        // High tone
-        this._playBeep(600, 0.25, now + 0.3);  // Low tone
-        this._playBeep(800, 0.25, now + 0.6);  // High tone
-        this._playBeep(600, 0.25, now + 0.9);  // Low tone
-      } catch (e) {
-        console.error('Alarm sound error:', e);
-      }
+    // วิธี 1: Web Audio API (เสียงดีกว่า, เล่นทันที)
+    if (this.audioCtx && this.alarmBuffer && this.isUnlocked) {
+      this._playWithWebAudio();
+    }
+    // วิธี 2: HTML5 Audio fallback (สำหรับ mobile ที่ Web Audio ไม่ทำงาน)
+    else if (this.fallbackAudio) {
+      this._playWithFallback();
+    }
+  }
+
+  _playWithWebAudio() {
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume();
+    }
+
+    const playOnce = () => {
+      if (!this.isPlaying || !this.audioCtx || !this.alarmBuffer) return;
+      const source = this.audioCtx.createBufferSource();
+      source.buffer = this.alarmBuffer;
+      source.connect(this.audioCtx.destination);
+      source.start(0);
     };
 
-    playCycle();
-    this.intervalId = setInterval(playCycle, 2000); // Repeat every 2 seconds
+    playOnce();
+    this.intervalId = setInterval(playOnce, 2000);
+  }
+
+  _playWithFallback() {
+    if (!this.fallbackAudio) return;
+    try {
+      this.fallbackAudio.currentTime = 0;
+      this.fallbackAudio.volume = 1;
+      const p = this.fallbackAudio.play();
+      if (p) p.catch(() => { }); // ignore autoplay errors
+    } catch (e) { /* ignore */ }
   }
 
   stop() {
     this.isPlaying = false;
+
+    // หยุด Web Audio
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+    }
+
+    // หยุด fallback audio
+    if (this.fallbackAudio) {
+      try {
+        this.fallbackAudio.pause();
+        this.fallbackAudio.currentTime = 0;
+      } catch (e) { /* ignore */ }
     }
   }
 
   dispose() {
     this.stop();
     if (this.audioCtx) {
-      this.audioCtx.close();
+      this.audioCtx.close().catch(() => { });
       this.audioCtx = null;
     }
+    this.fallbackAudio = null;
+    this.alarmBuffer = null;
   }
 }
 
@@ -103,12 +274,15 @@ const App = () => {
   const [error, setError] = useState(null);
   const [isMuted, setIsMuted] = useState(false);
   const [alarmAcknowledged, setAlarmAcknowledged] = useState(false);
+  const [audioReady, setAudioReady] = useState(false);
   const eventSourceRef = useRef(null);
   const alarmRef = useRef(null);
 
-  // Initialize alarm instance
+  // Initialize alarm instance — unlock audio ตั้งแต่ user interact ครั้งแรก
   useEffect(() => {
-    alarmRef.current = new AlarmSound();
+    const alarm = new AlarmSound();
+    alarmRef.current = alarm;
+    alarm.init((unlocked) => setAudioReady(unlocked));
     return () => {
       if (alarmRef.current) {
         alarmRef.current.dispose();
@@ -413,19 +587,39 @@ const App = () => {
             {new Date().toLocaleDateString('th-TH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
           </div>
           <button
-            className={`settings-btn ${isMuted ? 'muted' : ''}`}
+            className={`settings-btn ${isMuted ? 'muted' : ''} ${audioReady ? 'audio-ready' : 'audio-locked'}`}
             id="mute-toggle"
             aria-label={isMuted ? 'Unmute alarm' : 'Mute alarm'}
             onClick={toggleMute}
-            title={isMuted ? 'เปิดเสียงเตือน' : 'ปิดเสียงเตือน'}
+            title={
+              !audioReady
+                ? 'แตะเพื่อเปิดใช้เสียงเตือน'
+                : isMuted
+                  ? 'เปิดเสียงเตือน'
+                  : 'ปิดเสียงเตือน'
+            }
           >
             {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+            {!audioReady && <span className="audio-badge">!</span>}
           </button>
           <button className="settings-btn" id="settings-button" aria-label="Settings">
             <Settings size={20} />
           </button>
         </div>
       </header>
+
+      {/* Audio unlock prompt (สำหรับ Mobile) */}
+      {!audioReady && (
+        <div
+          className="audio-unlock-banner"
+          onClick={() => alarmRef.current?._unlock()}
+          role="button"
+          tabIndex={0}
+        >
+          <Volume2 size={18} />
+          <span>แตะที่นี่เพื่อเปิดใช้เสียงแจ้งเตือน</span>
+        </div>
+      )}
 
       {/* Error Banner */}
       {error && (
