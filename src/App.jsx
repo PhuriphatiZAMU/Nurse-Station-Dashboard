@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import {
   Activity,
   User,
@@ -85,7 +86,7 @@ class AlarmSound {
           this.fallbackAudio.pause();
           this.fallbackAudio.currentTime = 0;
           this.fallbackAudio.volume = 1;
-        } catch (e) { /* ไม่เป็นไร */ }
+        } catch { /* ไม่เป็นไร */ }
       }
 
       this.isUnlocked = true;
@@ -233,7 +234,7 @@ class AlarmSound {
       this.fallbackAudio.volume = 1;
       const p = this.fallbackAudio.play();
       if (p) p.catch(() => { }); // ignore autoplay errors
-    } catch (e) { /* ignore */ }
+    } catch { /* ignore */ }
   }
 
   stop() {
@@ -250,7 +251,7 @@ class AlarmSound {
       try {
         this.fallbackAudio.pause();
         this.fallbackAudio.currentTime = 0;
-      } catch (e) { /* ignore */ }
+      } catch { /* ignore */ }
     }
   }
 
@@ -755,6 +756,8 @@ const App = () => {
           </div>
         </div>
       </footer>
+
+      <SpeedInsights />
     </div>
   );
 };
