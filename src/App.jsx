@@ -276,6 +276,7 @@ export default function App() {
         const data = snapshot.val() || {};
         setWardData(data);
         setConnected(true);
+        setError(null); // Clear setup/connection errors on success
         setLoading(false);
       }, (err) => {
         console.error("Ward Listen Error:", err);
@@ -291,12 +292,17 @@ export default function App() {
     };
 
     // Authenticate (Anonymous)
-    if (!firebaseConfig.apiKey) {
-      console.warn("⚠️ Missing Firebase API Key. Attempting direct database connection (might fail if rules require auth).");
-      // Still try to listen, maybe rules are open
+    // Authenticate (Anonymous)
+    const isPlaceholderKey = !firebaseConfig.apiKey || firebaseConfig.apiKey === 'your-api-key-here';
+
+    if (isPlaceholderKey) {
+      console.warn("⚠️ No valid API Key found. Skipping Auth and attempting direct DB connection.");
+      // Try to listen without auth (works if rules are .read: true)
       setupListeners();
-      // But allow UI to show warning
-      if (!connected) setError("Missing API Key in .env. Authentication disabled.");
+
+      if (!connected) {
+        setError("Setup Required: Valid Web API Key missing.");
+      }
       setLoading(false);
     } else {
       signInAnonymously(auth)
@@ -306,7 +312,14 @@ export default function App() {
         })
         .catch((err) => {
           console.error("Auth Error:", err);
-          setError(`Authentication failed: ${err.message}. Check API Key.`);
+          // If auth fails, we still try to listen in case rules allow public read
+          setupListeners();
+
+          if (err.code === 'auth/api-key-not-valid') {
+            setError("Invalid API Key: Please update .env with the Web API Key from Firebase Console.");
+          } else {
+            setError(`Authentication failed: ${err.message}`);
+          }
           setLoading(false);
         });
     }
@@ -447,10 +460,23 @@ export default function App() {
       </header>
 
       {/* --- Error Banner --- */}
+      {/* --- Error Banner --- */}
       {error && (
-        <div className="max-w-7xl mx-auto mb-6 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-xl text-yellow-500 flex items-center gap-3">
-          <AlertTriangle size={20} />
-          <span>{error}</span>
+        <div className="max-w-7xl mx-auto mb-6 p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-red-200 flex flex-col md:flex-row items-center justify-between gap-4 backdrop-blur-sm">
+          <div className="flex items-center gap-3">
+            <AlertTriangle size={24} className="text-red-500 shrink-0" />
+            <span className="font-medium">{error}</span>
+          </div>
+          {(error.includes("API Key") || error.includes("Setup Required")) && (
+            <a
+              href="https://console.firebase.google.com/project/_/settings/general/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-bold text-sm transition-colors shadow-lg whitespace-nowrap"
+            >
+              Get API Key →
+            </a>
+          )}
         </div>
       )}
 
