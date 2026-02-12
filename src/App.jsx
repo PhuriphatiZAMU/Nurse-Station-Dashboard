@@ -430,6 +430,7 @@ export default function App() {
 
     window.addEventListener('click', unlockAudio, { once: true });
     window.addEventListener('touchstart', unlockAudio, { once: true });
+    window.addEventListener('keydown', unlockAudio, { once: true });
 
     // Attempt immediate unlock (might work if cached permission)
     unlockAudio();
@@ -437,6 +438,7 @@ export default function App() {
     return () => {
       window.removeEventListener('click', unlockAudio);
       window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
     };
   }, []);
 
