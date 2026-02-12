@@ -15,7 +15,9 @@ import {
   Unplug,
   Wifi,
   WifiOff,
-  AlertTriangle
+  AlertTriangle,
+  Save,
+  X
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -241,6 +243,34 @@ export default function App() {
   // Data State
   const [wardData, setWardData] = useState({});
   const [devices, setDevices] = useState({});
+  const [editingDevice, setEditingDevice] = useState(null);
+
+  const handleSaveConfig = async (deviceId, roomId, patientName) => {
+    try {
+      if (!roomId) return alert("Room ID cannot be empty");
+
+      const normalizedRoom = roomId.trim().toLowerCase().startsWith('room_')
+        ? roomId.trim()
+        : `room_${roomId.trim()}`;
+
+      const updates = {};
+      // Update Device Config so board knows where it is
+      updates[`hospital_system/devices/${deviceId}/config/room_id`] = normalizedRoom;
+      updates[`hospital_system/devices/${deviceId}/config/patient_name`] = patientName;
+      updates[`hospital_system/devices/${deviceId}/config/assigned_room`] = normalizedRoom; // Legacy field consistent
+
+      // OPTIONAL: Update Ward Data directly so changes reflect immediately even if device is offline
+      // This makes the dashboard feel "instant"
+      updates[`hospital_system/wards/ward_A/${normalizedRoom}/patient_info/name`] = patientName;
+
+      await update(ref(db), updates);
+      console.log(`Updated ${deviceId} -> ${normalizedRoom} : ${patientName}`);
+      setEditingDevice(null);
+    } catch (err) {
+      console.error("Config Save Error:", err);
+      alert("Failed to update: " + err.message);
+    }
+  };
 
   // Alert State
   const [activeAlert, setActiveAlert] = useState(false);
@@ -634,8 +664,149 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB: DEVICE MANAGER */}
+        {/* --- Devices Tab (Management) --- */}
         {activeTab === 'devices' && (
+          <div className="space-y-6 animate-in fade-in zoom-in duration-300">
+            <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
+              <div className="flex justify-between items-center mb-6">
+                <div>
+                  <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+                    <Cpu className="text-blue-400" />
+                    Device Registry
+                  </h2>
+                  <p className="text-slate-400 text-sm mt-1">Manage connected ESP32 & ESP8266 units</p>
+                </div>
+                <div className="bg-blue-500/10 text-blue-400 px-3 py-1 rounded-full text-xs border border-blue-500/20">
+                  {Object.keys(devices).length} Active Units
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-slate-700 text-slate-400 text-sm uppercase tracking-wider">
+                      <th className="p-4 font-medium">Status</th>
+                      <th className="p-4 font-medium">Device ID</th>
+                      <th className="p-4 font-medium">Type / Model</th>
+                      <th className="p-4 font-medium">Assigned Room</th>
+                      <th className="p-4 font-medium">Patient Name</th>
+                      <th className="p-4 font-medium text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800 text-slate-300">
+                    {Object.entries(devices).map(([deviceId, device]) => {
+                      const isEditing = editingDevice === deviceId;
+                      const isOnline = (Date.now() - (device.status?.last_seen || 0)) < 60000; // 1 min threshold
+                      const currentRoom = device.config?.room_id || 'Unassigned';
+
+                      return (
+                        <tr key={deviceId} className="hover:bg-slate-800/30 transition-colors group">
+                          <td className="p-4">
+                            <div className="flex items-center gap-2">
+                              <span className={cn("w-2.5 h-2.5 rounded-full", isOnline ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-slate-600")} />
+                              <span className="text-xs text-slate-500">{isOnline ? "Online" : "Offline"}</span>
+                            </div>
+                          </td>
+                          <td className="p-4 font-mono text-sm text-white">{deviceId}</td>
+                          <td className="p-4 text-sm">
+                            <div className="flex flex-col">
+                              <span className="text-white">{device.info?.type || 'Unknown'}</span>
+                              <span className="text-xs text-slate-500">{device.info?.model}</span>
+                            </div>
+                          </td>
+
+                          {/* --- Editable Fields --- */}
+                          <td className="p-4">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                defaultValue={currentRoom.replace('room_', '')}
+                                id={`edit-room-${deviceId}`}
+                                className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white text-sm focus:border-blue-500 outline-none"
+                                placeholder="e.g. 101"
+                              />
+                            ) : (
+                              <span className="bg-slate-800 px-2 py-1 rounded text-sm text-blue-200">
+                                {currentRoom.replace('room_', 'Room ')}
+                              </span>
+                            )}
+                          </td>
+                          <td className="p-4">
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                defaultValue={device.config?.patient_name || ''}
+                                id={`edit-patient-${deviceId}`}
+                                className="w-40 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white text-sm focus:border-blue-500 outline-none"
+                                placeholder="Patient Name"
+                              />
+                            ) : (
+                              <span className="text-slate-300 text-sm">
+                                {device.config?.patient_name || '-'}
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="p-4 text-right">
+                            {isEditing ? (
+                              <div className="flex justify-end gap-2">
+                                <button
+                                  onClick={() => {
+                                    const r = document.getElementById(`edit-room-${deviceId}`).value;
+                                    const p = document.getElementById(`edit-patient-${deviceId}`).value;
+                                    handleSaveConfig(deviceId, r, p);
+                                  }}
+                                  className="p-2 bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30 rounded-lg transition"
+                                  title="Save"
+                                >
+                                  <Save size={16} />
+                                </button>
+                                <button
+                                  onClick={() => setEditingDevice(null)}
+                                  className="p-2 bg-slate-700/50 text-slate-400 hover:bg-slate-700 rounded-lg transition"
+                                  title="Cancel"
+                                >
+                                  <X size={16} />
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button
+                                  onClick={() => setEditingDevice(deviceId)}
+                                  className="p-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition"
+                                  title="Edit Configuration"
+                                >
+                                  <Settings size={16} />
+                                </button>
+                                <button
+                                  onClick={() => handleUnlink(deviceId)}
+                                  className="p-2 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition"
+                                  title="Unlink / Reset"
+                                >
+                                  <Unplug size={16} />
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {Object.keys(devices).length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="p-8 text-center text-slate-500 italic">
+                          No devices connected. Power on ESP32/ESP8266 units to see them here.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+
+        {activeTab === 'devices_legacy' && (
           <div className="bg-slate-900/40 border border-slate-800 rounded-3xl overflow-hidden backdrop-blur-sm">
             <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900/60">
               <h2 className="text-xl font-bold text-white flex items-center gap-2">
