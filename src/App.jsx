@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, onValue, update } from "firebase/database";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
+import { getAnalytics } from "firebase/analytics";
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import {
   Activity,
@@ -25,28 +26,20 @@ function cn(...inputs) {
 }
 
 // --- Firebase Configuration ---
-// Note: SDK requires full config including ApiKey, ProjectId if using Auth
-// For this hybrid approach, we assume the environment variables are set correctly for SDK usage
-// The previous REST approach only needed URL/Secret.
-// Since the user requested SDK v11, we will attempt to reconstruct the config or fallback to REST if key missing.
-// However, the prompt implies "Plug & Play" via SDK which usually needs a full config object.
-// Let's assume standard VITE_FIREBASE_CONFIG or construct it if possible.
-// Wait, the environment variables we have are just DATABASE_URL and SECRET (for REST).
-// Using SDK requires API_KEY for Auth.
-// I will try to use the REST URL + Secret auth if SDK Auth fails, OR allow unauthenticated read if rules permit.
-// BUT Prompt says: "Authenticate before Query always (Anonymous Auth)".
-// This implies we need an API Key. I'll add a placeholder and check if it exists, notifying user if not.
-
 const firebaseConfig = {
-  databaseURL: import.meta.env.VITE_DATABASE_URL || "https://preserving-fall-detector-default-rtdb.firebaseio.com",
-  // The user might need to add these to .env if not present
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  databaseURL: import.meta.env.VITE_DATABASE_URL || "https://preserving-fall-detector-default-rtdb.firebaseio.com",
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app); // Initialize Analytics
 const db = getDatabase(app);
 const auth = getAuth(app);
 
