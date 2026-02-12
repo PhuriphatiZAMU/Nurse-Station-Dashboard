@@ -439,9 +439,6 @@ export default function App() {
     document.addEventListener('keydown', unlockHandler, { once: true });
     document.addEventListener('touchend', unlockHandler, { once: true });
 
-    // Attempt immediate unlock (might work if cached permission)
-    unlockAudio();
-
     return () => {
       document.removeEventListener('click', unlockHandler);
       document.removeEventListener('keydown', unlockHandler);
