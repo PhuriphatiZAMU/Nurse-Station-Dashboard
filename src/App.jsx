@@ -401,6 +401,32 @@ export default function App() {
     }));
   };
 
+  // Global Auto-Unlock (Any interaction enabling audio)
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (alarmRef.current) {
+        alarmRef.current._unlock().then(() => {
+          setAudioReady(true);
+          // Ask for notification permission silently on first click
+          if ("Notification" in window && Notification.permission !== "granted") {
+            Notification.requestPermission();
+          }
+        });
+      }
+    };
+
+    window.addEventListener('click', unlockAudio, { once: true });
+    window.addEventListener('touchstart', unlockAudio, { once: true });
+
+    // Attempt immediate unlock (might work if cached permission)
+    unlockAudio();
+
+    return () => {
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+    };
+  }, []);
+
   if (loading) {
     return (
       <div className="flex h-screen w-full flex-col items-center justify-center bg-slate-950 text-white">
@@ -496,17 +522,6 @@ export default function App() {
               Get API Key →
             </a>
           )}
-        </div>
-      )}
-
-      {/* --- Audio Unlock Banner (Mobile) --- */}
-      {!audioReady && (
-        <div
-          onClick={() => alarmRef.current?._unlock()}
-          className="max-w-7xl mx-auto mb-6 py-3 px-4 bg-blue-500/10 border border-blue-500/30 rounded-xl text-blue-400 text-sm font-medium flex items-center justify-center gap-2 cursor-pointer active:bg-blue-500/20 transition select-none"
-        >
-          <Volume2 size={18} />
-          Tap to enable Sound & Notifications
         </div>
       )}
 
