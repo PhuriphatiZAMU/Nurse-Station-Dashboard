@@ -58,17 +58,6 @@ class AlarmSound {
   init(onUnlockCallback) {
     this._onUnlock = onUnlockCallback;
     this._createFallbackAudio();
-
-    const unlockHandler = () => {
-      this._unlock();
-      ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
-        document.removeEventListener(evt, unlockHandler, { capture: true });
-      });
-    };
-
-    ['click', 'touchstart', 'touchend', 'keydown'].forEach(evt => {
-      document.addEventListener(evt, unlockHandler, { capture: true, passive: true });
-    });
   }
 
   async _unlock() {
