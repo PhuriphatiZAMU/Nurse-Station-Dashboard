@@ -428,17 +428,24 @@ export default function App() {
       }
     };
 
-    window.addEventListener('click', unlockAudio, { once: true });
-    window.addEventListener('touchstart', unlockAudio, { once: true });
-    window.addEventListener('keydown', unlockAudio, { once: true });
+    const unlockHandler = () => {
+      unlockAudio();
+      document.removeEventListener('click', unlockHandler);
+      document.removeEventListener('keydown', unlockHandler);
+      document.removeEventListener('touchend', unlockHandler);
+    };
+
+    document.addEventListener('click', unlockHandler, { once: true });
+    document.addEventListener('keydown', unlockHandler, { once: true });
+    document.addEventListener('touchend', unlockHandler, { once: true });
 
     // Attempt immediate unlock (might work if cached permission)
     unlockAudio();
 
     return () => {
-      window.removeEventListener('click', unlockAudio);
-      window.removeEventListener('touchstart', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
+      document.removeEventListener('click', unlockHandler);
+      document.removeEventListener('keydown', unlockHandler);
+      document.removeEventListener('touchend', unlockHandler);
     };
   }, []);
 
