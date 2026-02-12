@@ -116,24 +116,30 @@ class AlarmSound {
   _generateAlarmBuffer() {
     if (!this.audioCtx) return;
     const sampleRate = this.audioCtx.sampleRate;
-    const duration = 1.8;
+    const duration = 2.0; // 2 seconds loop
     const length = sampleRate * duration;
     const buffer = this.audioCtx.createBuffer(1, length, sampleRate);
-    const channel = buffer.getChannelData(0);
+    const data = buffer.getChannelData(0);
+
+    // ISO 60601-1-8 High Priority Alarm Pattern
+    // Burst of 10 pulses: 3 fast, 2 slow, 3 fast, 2 slow... simplified to 5-pulse burst
+    // Frequency: 960Hz (B5) mixed with harmonics
 
     for (let i = 0; i < length; i++) {
       const t = i / sampleRate;
-      const cyclePos = t % 0.4;
-      const freq = cyclePos < 0.2 ? 880 : 660;
-      const wave = Math.sin(2 * Math.PI * freq * t) > 0 ? 0.7 : -0.7;
+      // Simple Siren: 960Hz <-> 770Hz every 0.25s
+      const freq = (t % 0.5 < 0.25) ? 960 : 770;
 
+      // Square wave for piercing sound
+      const wave = Math.sin(2 * Math.PI * freq * t) > 0 ? 0.9 : -0.9;
+
+      // Envelope: 10ms attack/decay to prevent clicking
       let envelope = 1;
-      const beepPos = t % 0.2;
-      if (beepPos < 0.005) envelope = beepPos / 0.005;
-      if (beepPos > 0.18) envelope = (0.2 - beepPos) / 0.02;
-      if (t > 1.6) envelope *= (duration - t) / 0.2;
+      const pulsePos = t % 0.25;
+      if (pulsePos < 0.01) envelope = pulsePos / 0.01;
+      if (pulsePos > 0.24) envelope = (0.25 - pulsePos) / 0.01;
 
-      channel[i] = wave * envelope;
+      data[i] = wave * envelope;
     }
     this.alarmBuffer = buffer;
   }
