@@ -77,7 +77,12 @@ class AlarmSound {
         this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       }
       if (this.audioCtx.state === 'suspended') {
-        await this.audioCtx.resume();
+        try { await this.audioCtx.resume(); } catch { /* ignore */ }
+      }
+
+      // If still suspended/closed, abort silent tone to avoid console errors
+      if (this.audioCtx.state === 'suspended' || this.audioCtx.state === 'closed') {
+        return;
       }
 
       // Silent unlock tone
@@ -316,6 +321,8 @@ export default function App() {
 
           if (err.code === 'auth/api-key-not-valid') {
             setError("Invalid API Key: Please update .env with the Web API Key from Firebase Console.");
+          } else if (err.code === 'auth/configuration-not-found') {
+            setError("Setup Required: Enable 'Anonymous' sign-in provider in Firebase Console > Authentication > Sign-in method.");
           } else {
             setError(`Authentication failed: ${err.message}`);
           }
