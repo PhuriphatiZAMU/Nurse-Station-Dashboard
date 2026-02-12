@@ -250,10 +250,16 @@ export default function App() {
 
   const alarmRef = useRef(null);
 
-  // Initialize Audio
+  // Initialize Audio & Notifications
   useEffect(() => {
     alarmRef.current = new AlarmSound();
-    alarmRef.current.init((unlocked) => setAudioReady(unlocked));
+    alarmRef.current.init((unlocked) => {
+      setAudioReady(unlocked);
+      // Ask for notification permission on interaction
+      if (unlocked && "Notification" in window && Notification.permission !== "granted") {
+        Notification.requestPermission();
+      }
+    });
     return () => alarmRef.current?.dispose();
   }, []);
 
@@ -333,7 +339,27 @@ export default function App() {
     // Only update state if changed to prevent loops
     if (emergency !== activeAlert) {
       setActiveAlert(emergency);
-      if (emergency) setAlarmAcknowledged(false); // Reset ack on new alert
+      if (emergency) {
+        setAlarmAcknowledged(false); // Reset ack on new alert
+
+        // --- IMMEDIATE SYSTEM ALERT (Background/Locked fallback) ---
+        // 1. Vibrate device (SOS Pattern: ... --- ...)
+        if (navigator.vibrate) {
+          navigator.vibrate([100, 50, 100, 50, 100, 200, 300, 100, 300, 100, 300, 200, 100, 50, 100, 50, 100]);
+        }
+
+        // 2. System Notification (Visual + Sound outside browser)
+        if ("Notification" in window && Notification.permission === "granted") {
+          try {
+            new Notification("🚨 FALL DETECTED!", {
+              body: "Connect to Dashboard immediately! Patient requires assistance.",
+              icon: "/vite.png", // Use our new logo
+              requireInteraction: true, // Keep notification until clicked
+              tag: "fall-alert" // Prevent duplicate stacking
+            });
+          } catch (e) { console.error("Notification failed", e); }
+        }
+      }
     }
   }, [wardData, activeAlert]);
 
@@ -480,7 +506,7 @@ export default function App() {
           className="max-w-7xl mx-auto mb-6 py-3 px-4 bg-blue-500/10 border border-blue-500/30 rounded-xl text-blue-400 text-sm font-medium flex items-center justify-center gap-2 cursor-pointer active:bg-blue-500/20 transition select-none"
         >
           <Volume2 size={18} />
-          Tap here to enable sound alerts
+          Tap to enable Sound & Notifications
         </div>
       )}
 
