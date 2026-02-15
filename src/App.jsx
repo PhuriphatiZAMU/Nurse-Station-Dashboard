@@ -385,7 +385,13 @@ export default function App() {
 
     // Check ward rooms
     Object.entries(wardData).forEach(([roomKey, room]) => {
-      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
+      // Check ALL possible fall data paths:
+      // 1. live_status.fall_detected (Original plan)
+      // 2. motion.val > 0 (ESP32-S3-CAM existing logic)
+      // 3. fall_detection.status === 'Fall Down' (New requirement per user)
+      const isFall = room.live_status?.fall_detected ||
+        (room.motion?.val > 0) ||
+        (room.fall_detection?.status === 'Fall Down');
       const isAck = room.live_status?.acknowledged === true;
 
       if (isFall) {
@@ -473,7 +479,10 @@ export default function App() {
 
   const handleAcknowledgeAll = async () => {
     Object.entries(wardData).forEach(async ([key, room]) => {
-      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
+      // Logic must match Alert Logic above
+      const isFall = room.live_status?.fall_detected ||
+        (room.motion?.val > 0) ||
+        (room.fall_detection?.status === 'Fall Down');
       const isAck = room.live_status?.acknowledged === true;
       if (isFall && !isAck) {
         await handleAcknowledge(key);
@@ -714,7 +723,11 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {Object.entries(wardData).map(([key, room]) => {
                 // Status Logic
-                const isFall = room.live_status?.fall_detected || (room.motion?.val > 0) || (sensorData?.status === 'Fall Down');
+                const isFall = room.live_status?.fall_detected ||
+                  (room.motion?.val > 0) ||
+                  (sensorData?.status === 'Fall Down') ||
+                  (room.fall_detection?.status === 'Fall Down');
+
                 const isAck = room.live_status?.acknowledged === true;
                 const isEmergency = isFall && !isAck;
                 const isWaiting = isFall && isAck;
@@ -738,17 +751,26 @@ export default function App() {
                         )}>
                           {key.replace('room_', '')}
                         </div>
+
                         <div>
                           <h3 className="text-lg font-bold text-slate-100">
                             {room.patient_info?.name || room.config?.patient_name || `Room ${key.replace('room_', '')}`}
                           </h3>
-                          <p className={cn(
-                            "text-xs font-bold uppercase tracking-wider flex items-center gap-1.5",
-                            isOffline ? "text-slate-500" : "text-green-500"
-                          )}>
-                            <span className={cn("w-1.5 h-1.5 rounded-full", isOffline ? "bg-slate-600" : "bg-green-500")} />
-                            {isOffline ? "OFFLINE" : "ACTIVE MONITORING"}
-                          </p>
+                          <div className="flex flex-col">
+                            <p className={cn(
+                              "text-xs font-bold uppercase tracking-wider flex items-center gap-1.5",
+                              isOffline ? "text-slate-500" : "text-green-500"
+                            )}>
+                              <span className={cn("w-1.5 h-1.5 rounded-full", isOffline ? "bg-slate-600" : "bg-green-500")} />
+                              {isOffline ? "OFFLINE" : "ACTIVE MONITORING"}
+                            </p>
+                            {/* Show Last Update if available from new path */}
+                            {room.fall_detection?.last_update && (
+                              <p className="text-[10px] text-slate-500 mt-0.5">
+                                Updated: {room.fall_detection.last_update}
+                              </p>
+                            )}
+                          </div>
                         </div>
                       </div>
                       {isEmergency && <ShieldAlert className="text-red-500 animate-pulse" size={28} />}
@@ -873,7 +895,12 @@ export default function App() {
                       <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
                         {pairedRooms.map(([roomKey, group]) => {
                           const roomData = wardData[roomKey];
-                          const isFall = roomData?.live_status?.fall_detected || (roomData?.motion?.val > 0) || (sensorData?.status === 'Fall Down') || false;
+                          const isFall = roomData?.live_status?.fall_detected ||
+                            (roomData?.motion?.val > 0) ||
+                            (sensorData?.status === 'Fall Down') ||
+                            (roomData?.fall_detection?.status === 'Fall Down') ||
+                            false;
+
                           const isAck = roomData?.live_status?.acknowledged === true && isFall;
                           const isFallDetected = isFall && !isAck; // Only show RED if not acked
                           const patientName = roomData?.patient_info?.name || 'Unknown Patient';
