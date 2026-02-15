@@ -669,7 +669,7 @@ export default function App() {
         {/* --- Devices Tab: Pairing & Management --- */}
         {activeTab === 'devices' && (
           <div className="space-y-6 animate-in fade-in zoom-in duration-300">
-            {/* Header Card */}
+            {/* Header */}
             <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
                 <div>
@@ -678,188 +678,326 @@ export default function App() {
                     🔌 Device Pairing & Management
                   </h2>
                   <p className="text-slate-400 text-sm mt-1">
-                    Plug & Play — assign ESP32/ESP8266 boards to patient rooms
+                    Plug & Play — auto-pair ESP boards to patient rooms
                   </p>
                 </div>
-                <div className="flex gap-2">
-                  <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1 rounded-full text-xs font-bold border border-emerald-500/20">
+                <div className="flex gap-2 flex-wrap">
+                  <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-full text-xs font-bold border border-emerald-500/20 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                     {Object.values(devices).filter(d => d.config?.assigned_room && d.config?.assigned_room !== 'none').length} Paired
                   </span>
-                  <span className="bg-amber-500/10 text-amber-400 px-3 py-1 rounded-full text-xs font-bold border border-amber-500/20">
+                  <span className="bg-amber-500/10 text-amber-400 px-3 py-1.5 rounded-full text-xs font-bold border border-amber-500/20 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-amber-500" />
                     {Object.values(devices).filter(d => !d.config?.assigned_room || d.config?.assigned_room === 'none').length} Pending
                   </span>
-                  <span className="bg-blue-500/10 text-blue-400 px-3 py-1 rounded-full text-xs font-bold border border-blue-500/20">
+                  <span className="bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-full text-xs font-bold border border-blue-500/20">
                     {Object.keys(devices).length} Total
                   </span>
                 </div>
               </div>
 
               {/* Device Cards Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                 {Object.entries(devices).map(([deviceId, device]) => {
                   const isEditing = editingDevice === deviceId;
                   const isOnline = (Date.now() - (device.status?.last_seen || 0)) < 60000;
                   const assignedRoom = device.config?.assigned_room;
                   const isPaired = assignedRoom && assignedRoom !== 'none';
                   const isCAM = device.info?.model?.includes('CAM') || device.info?.type?.includes('CAM');
+                  // Pull live room data from wardData
+                  const roomData = isPaired ? wardData[assignedRoom] : null;
+                  const patientName = roomData?.patient_info?.name || device.config?.patient_name || 'No Patient';
+                  const isFallDetected = roomData?.live_status?.fall_detected || false;
+                  const isRoomOnline = roomData?.live_status?.online !== false;
 
                   return (
                     <div
                       key={deviceId}
                       className={cn(
-                        "p-5 rounded-xl border-2 transition-all duration-300 relative overflow-hidden group",
+                        "rounded-2xl border-2 transition-all duration-500 relative overflow-hidden",
                         isPaired
-                          ? "border-emerald-500/40 bg-slate-800/60 hover:border-emerald-400/60"
-                          : "border-amber-500/40 bg-slate-800/60 animate-pulse hover:border-amber-400/60"
+                          ? isFallDetected
+                            ? "border-red-500/60 bg-red-950/20 shadow-[0_0_20px_rgba(220,38,38,0.15)]"
+                            : "border-emerald-500/30 bg-slate-800/40 hover:border-emerald-400/50"
+                          : "border-amber-500/30 bg-slate-800/40 hover:border-amber-400/50"
                       )}
                     >
-                      {/* Status Badge */}
-                      <div className="flex justify-between items-start mb-4">
-                        <div className="flex-1 min-w-0">
-                          <h3 className="text-sm font-mono font-bold text-blue-400 truncate">{deviceId}</h3>
-                          <p className="text-xs text-slate-500 mt-1">
-                            {device.info?.model || 'Unknown Model'}
-                            {device.info?.type ? ` • ${device.info.type}` : ''}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2 ml-2 flex-shrink-0">
-                          {/* Online/Offline Dot */}
-                          <span className={cn(
-                            "w-2 h-2 rounded-full",
-                            isOnline ? "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" : "bg-slate-600"
-                          )} />
-                          {/* Paired/Pending Badge */}
-                          <span className={cn(
-                            "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
-                            isPaired
-                              ? "bg-emerald-900/60 text-emerald-300 border border-emerald-500/30"
-                              : "bg-amber-900/60 text-amber-300 border border-amber-500/30"
-                          )}>
-                            {isPaired ? 'PAIRED' : 'PENDING'}
-                          </span>
-                        </div>
-                      </div>
+                      {isPaired && !isEditing ? (
+                        /* ====== PAIRED VIEW: Device ↔ Room ====== */
+                        <div className="flex flex-col sm:flex-row">
+                          {/* Left: Device Side */}
+                          <div className="flex-1 p-5 border-b sm:border-b-0 sm:border-r border-slate-700/50">
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <Cpu size={16} className="text-blue-400" />
+                                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Device</span>
+                              </div>
+                              <span className={cn(
+                                "w-2 h-2 rounded-full",
+                                isOnline ? "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" : "bg-slate-600"
+                              )} />
+                            </div>
+                            <h3 className="text-sm font-mono font-bold text-blue-400 truncate mb-1">{deviceId}</h3>
+                            <p className="text-xs text-slate-500">
+                              {device.info?.model || 'Unknown'} {device.info?.type ? `• ${device.info.type}` : ''}
+                            </p>
+                            <div className="mt-3 space-y-1 text-xs">
+                              <div className="flex justify-between text-slate-400">
+                                <span>IP</span>
+                                <span className="font-mono text-slate-300">{device.info?.ip || 'N/A'}</span>
+                              </div>
+                              <div className="flex justify-between text-slate-400">
+                                <span>Status</span>
+                                <span className={isOnline ? "text-emerald-400" : "text-slate-500"}>
+                                  {isOnline ? '● Online' : '○ Offline'}
+                                </span>
+                              </div>
+                            </div>
 
-                      {/* Device Info */}
-                      <div className="space-y-2 mb-4 text-sm">
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">IP Address</span>
-                          <span className="font-mono text-slate-300">{device.info?.ip || device.status?.ip || 'Offline'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-500">Status</span>
-                          <span className={isOnline ? "text-emerald-400 font-medium" : "text-slate-500"}>
-                            {isOnline ? '● Online' : '○ Offline'}
-                          </span>
-                        </div>
-                        {isPaired && (
-                          <div className="flex justify-between">
-                            <span className="text-slate-500">Assigned</span>
-                            <span className="text-blue-300 font-medium">
-                              {assignedRoom.replace('room_', 'Room ')}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Edit Mode or Quick Pair */}
-                      {isEditing ? (
-                        <div className="space-y-3 p-3 bg-slate-950/50 rounded-lg border border-slate-700">
-                          <div>
-                            <label className="block text-xs text-slate-500 mb-1">Room ID</label>
-                            <input
-                              type="text"
-                              defaultValue={isPaired ? assignedRoom.replace('room_', '') : ''}
-                              id={`edit-room-${deviceId}`}
-                              className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
-                              placeholder="e.g. 301"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-xs text-slate-500 mb-1">Patient Name</label>
-                            <input
-                              type="text"
-                              defaultValue={device.config?.patient_name || ''}
-                              id={`edit-patient-${deviceId}`}
-                              className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
-                              placeholder="Patient Name"
-                            />
-                          </div>
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => {
-                                const r = document.getElementById(`edit-room-${deviceId}`).value;
-                                const p = document.getElementById(`edit-patient-${deviceId}`).value;
-                                handleSaveConfig(deviceId, r, p);
-                              }}
-                              className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1"
-                            >
-                              <Save size={14} /> Save
-                            </button>
-                            <button
-                              onClick={() => setEditingDevice(null)}
-                              className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {/* Quick Assign Dropdown */}
-                          <div>
-                            <label className="block text-xs text-slate-500 mb-1">Quick Assign Room:</label>
-                            <div className="relative">
-                              <select
-                                value={assignedRoom || 'none'}
-                                onChange={(e) => handleAssignRoom(deviceId, e.target.value)}
-                                className={cn(
-                                  "appearance-none w-full bg-slate-950 border text-white py-2 px-3 pr-8 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer",
-                                  isPaired ? "border-emerald-500/30" : "border-slate-700"
-                                )}
+                            {/* Camera link */}
+                            {isCAM && device.info?.ip && (
+                              <a
+                                href={`http://${device.info.ip}/capture`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-3 text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1"
                               >
-                                <option value="none">-- Unassigned --</option>
-                                {getRoomOptions().map(opt => (
-                                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                ))}
-                              </select>
-                              <Settings size={14} className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" />
+                                <Camera size={11} /> Camera <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Center: Pairing Connector */}
+                          <div className="hidden sm:flex flex-col items-center justify-center px-0 -mx-4 z-10 relative">
+                            <div className={cn(
+                              "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border-2",
+                              isFallDetected
+                                ? "bg-red-600 border-red-500 text-white animate-pulse shadow-[0_0_12px_rgba(220,38,38,0.5)]"
+                                : "bg-emerald-600/80 border-emerald-500/50 text-white shadow-[0_0_8px_rgba(16,185,129,0.3)]"
+                            )}>
+                              {isFallDetected ? <ShieldAlert size={14} /> : '⚡'}
+                            </div>
+                          </div>
+                          {/* Mobile connector */}
+                          <div className="sm:hidden flex items-center justify-center py-1 relative">
+                            <div className={cn(
+                              "w-6 h-6 rounded-full flex items-center justify-center text-[10px] border-2",
+                              isFallDetected
+                                ? "bg-red-600 border-red-500 text-white animate-pulse"
+                                : "bg-emerald-600/80 border-emerald-500/50 text-white"
+                            )}>
+                              {isFallDetected ? '!' : '⚡'}
                             </div>
                           </div>
 
-                          {/* Action Buttons */}
-                          <div className="flex gap-2 pt-2">
-                            <button
-                              onClick={() => setEditingDevice(deviceId)}
-                              className="flex-1 py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
-                            >
-                              <Settings size={12} /> Detail Edit
-                            </button>
-                            {isPaired && (
+                          {/* Right: Room Side */}
+                          <div className="flex-1 p-5">
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <Activity size={16} className={isFallDetected ? "text-red-400" : "text-emerald-400"} />
+                                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Room</span>
+                              </div>
+                              <span className={cn(
+                                "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                                isFallDetected
+                                  ? "bg-red-900/60 text-red-300 border border-red-500/30"
+                                  : "bg-emerald-900/60 text-emerald-300 border border-emerald-500/30"
+                              )}>
+                                {isFallDetected ? '⚠ FALL' : 'PAIRED'}
+                              </span>
+                            </div>
+
+                            <div className={cn(
+                              "w-12 h-12 rounded-xl flex items-center justify-center text-lg font-bold mb-2 transition-all",
+                              isFallDetected
+                                ? "bg-red-600 text-white shadow-lg shadow-red-600/30 animate-pulse"
+                                : "bg-slate-700/80 text-white"
+                            )}>
+                              {assignedRoom.replace('room_', '')}
+                            </div>
+                            <h4 className="text-base font-bold text-white truncate">{patientName}</h4>
+                            <p className={cn(
+                              "text-xs mt-1 flex items-center gap-1",
+                              isFallDetected ? "text-red-400 font-bold" : isRoomOnline ? "text-emerald-400" : "text-slate-500"
+                            )}>
+                              <span className={cn(
+                                "w-1.5 h-1.5 rounded-full",
+                                isFallDetected ? "bg-red-500 animate-pulse" : isRoomOnline ? "bg-emerald-500" : "bg-slate-600"
+                              )} />
+                              {isFallDetected ? 'FALL DETECTED!' : isRoomOnline ? 'Monitoring Active' : 'Offline'}
+                            </p>
+
+                            {/* Actions */}
+                            <div className="flex gap-2 mt-3">
+                              <button
+                                onClick={() => setEditingDevice(deviceId)}
+                                className="flex-1 py-1.5 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
+                              >
+                                <Settings size={11} /> Edit
+                              </button>
                               <button
                                 onClick={() => handleUnlink(deviceId)}
-                                className="py-2 px-3 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition text-xs"
-                                title="Unlink Device"
+                                className="py-1.5 px-2.5 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition text-xs"
+                                title="Unlink"
                               >
-                                <Unplug size={14} />
+                                <Unplug size={13} />
                               </button>
-                            )}
+                            </div>
                           </div>
                         </div>
-                      )}
+                      ) : isPaired && isEditing ? (
+                        /* ====== EDIT MODE (Paired Device) ====== */
+                        <div className="p-5">
+                          <div className="flex items-center gap-2 mb-4">
+                            <Cpu size={16} className="text-blue-400" />
+                            <h3 className="text-sm font-mono font-bold text-blue-400">{deviceId}</h3>
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-500/30">EDITING</span>
+                          </div>
+                          <div className="space-y-3 p-4 bg-slate-950/50 rounded-xl border border-slate-700">
+                            <div>
+                              <label className="block text-xs text-slate-500 mb-1">Room ID</label>
+                              <input
+                                type="text"
+                                defaultValue={assignedRoom.replace('room_', '')}
+                                id={`edit-room-${deviceId}`}
+                                className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                                placeholder="e.g. 301"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs text-slate-500 mb-1">Patient Name</label>
+                              <input
+                                type="text"
+                                defaultValue={device.config?.patient_name || roomData?.patient_info?.name || ''}
+                                id={`edit-patient-${deviceId}`}
+                                className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                                placeholder="Patient Name"
+                              />
+                            </div>
+                            <div className="flex gap-2 pt-1">
+                              <button
+                                onClick={() => {
+                                  const r = document.getElementById(`edit-room-${deviceId}`).value;
+                                  const p = document.getElementById(`edit-patient-${deviceId}`).value;
+                                  handleSaveConfig(deviceId, r, p);
+                                }}
+                                className="flex-1 py-2.5 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1"
+                              >
+                                <Save size={14} /> Save
+                              </button>
+                              <button
+                                onClick={() => setEditingDevice(null)}
+                                className="px-5 py-2.5 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        /* ====== PENDING VIEW (Not Paired) ====== */
+                        <div className="p-5">
+                          <div className="flex justify-between items-start mb-4">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
+                                <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-900/60 text-amber-300 border border-amber-500/30">
+                                  PENDING
+                                </span>
+                              </div>
+                              <h3 className="text-sm font-mono font-bold text-blue-400 truncate">{deviceId}</h3>
+                              <p className="text-xs text-slate-500 mt-0.5">
+                                {device.info?.model || 'Unknown Model'}
+                                {device.info?.type ? ` • ${device.info.type}` : ''}
+                              </p>
+                            </div>
+                            <span className={cn(
+                              "w-2 h-2 rounded-full mt-1",
+                              isOnline ? "bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" : "bg-slate-600"
+                            )} />
+                          </div>
 
-                      {/* Camera Stream Link (ESP32-S3-CAM only) */}
-                      {isCAM && isPaired && device.info?.ip && (
-                        <div className="mt-3 pt-3 border-t border-slate-700/50">
-                          <a
-                            href={`http://${device.info.ip}/capture`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-xs text-blue-400 hover:text-blue-300 hover:underline flex items-center gap-1 transition"
-                          >
-                            <Camera size={12} /> View Camera Stream
-                            <ExternalLink size={10} />
-                          </a>
+                          <div className="space-y-2 mb-4 text-xs text-slate-400">
+                            <div className="flex justify-between">
+                              <span>IP Address</span>
+                              <span className="font-mono text-slate-300">{device.info?.ip || 'N/A'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Network</span>
+                              <span className={isOnline ? "text-emerald-400" : "text-slate-500"}>
+                                {isOnline ? '● Online' : '○ Offline'}
+                              </span>
+                            </div>
+                          </div>
+
+                          {isEditing ? (
+                            <div className="space-y-3 p-3 bg-slate-950/50 rounded-lg border border-slate-700">
+                              <div>
+                                <label className="block text-xs text-slate-500 mb-1">Room ID</label>
+                                <input
+                                  type="text"
+                                  defaultValue=""
+                                  id={`edit-room-${deviceId}`}
+                                  className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                                  placeholder="e.g. 301"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-xs text-slate-500 mb-1">Patient Name</label>
+                                <input
+                                  type="text"
+                                  defaultValue=""
+                                  id={`edit-patient-${deviceId}`}
+                                  className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                                  placeholder="Patient Name"
+                                />
+                              </div>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => {
+                                    const r = document.getElementById(`edit-room-${deviceId}`).value;
+                                    const p = document.getElementById(`edit-patient-${deviceId}`).value;
+                                    handleSaveConfig(deviceId, r, p);
+                                  }}
+                                  className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1"
+                                >
+                                  <Save size={14} /> Pair & Save
+                                </button>
+                                <button
+                                  onClick={() => setEditingDevice(null)}
+                                  className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="space-y-2">
+                              {/* Quick Assign Dropdown */}
+                              <div>
+                                <label className="block text-xs text-slate-500 mb-1">Assign to Room:</label>
+                                <div className="relative">
+                                  <select
+                                    value="none"
+                                    onChange={(e) => handleAssignRoom(deviceId, e.target.value)}
+                                    className="appearance-none w-full bg-slate-950 border border-slate-700 text-white py-2 px-3 pr-8 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+                                  >
+                                    <option value="none">-- Select Room --</option>
+                                    {getRoomOptions().map(opt => (
+                                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                    ))}
+                                  </select>
+                                  <Settings size={14} className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" />
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => setEditingDevice(deviceId)}
+                                className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
+                              >
+                                <Settings size={12} /> Manual Pair
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
