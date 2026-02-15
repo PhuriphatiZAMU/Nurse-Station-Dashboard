@@ -21,7 +21,10 @@ import {
   ExternalLink,
   Camera,
   Monitor,
-  Link2
+  Link2,
+  CheckCircle,
+  Stethoscope,
+  XCircle
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -375,73 +378,133 @@ export default function App() {
   }, []); // Run once on mount
 
   // Alert Logic based on Data
-  // Checks THREE possible fall indicators:
-  //   1. room.live_status?.fall_detected (ideal structure)
-  //   2. room.motion?.val > 0 (ESP32-S3-CAM sends motion.val = 1 on fall)
-  //   3. sensorData.status === 'Fall Down' (global /sensor_data from ESP)
   useEffect(() => {
-    let emergency = false;
+    let hasFall = false;
+    let hasUnackedFall = false;
     let alertRoom = null;
 
-    // Check ward rooms for fall detection
+    // Check ward rooms
     Object.entries(wardData).forEach(([roomKey, room]) => {
-      // Method 1: live_status.fall_detected (ideal)
-      if (room.live_status?.fall_detected) {
-        emergency = true;
-        alertRoom = roomKey;
-      }
-      // Method 2: motion.val > 0 (actual ESP data structure)
-      if (room.motion?.val > 0) {
-        emergency = true;
-        alertRoom = roomKey;
+      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
+      const isAck = room.live_status?.acknowledged === true;
+
+      if (isFall) {
+        hasFall = true;
+        if (!isAck) {
+          hasUnackedFall = true;
+          alertRoom = roomKey;
+        }
       }
     });
 
-    // Method 3: Global sensor_data.status (fallback from ESP)
+    // Check global sensor (fallback)
     if (sensorData?.status === 'Fall Down' || sensorData?.status === 'fall_detected') {
-      emergency = true;
+      hasFall = true;
+      // Global sensor doesn't have per-room ack easily, so we assume unacked unless handled globally
+      // But typically this is tied to a single room in simple setups.
+      hasUnackedFall = true;
     }
 
-    // Only update state if changed to prevent loops
-    if (emergency !== activeAlert) {
-      setActiveAlert(emergency);
-      if (emergency) {
-        setAlarmAcknowledged(false); // Reset ack on new alert
-        console.log('🚨 FALL ALERT triggered!', { alertRoom, sensorStatus: sensorData?.status });
+    // Update active alert state (Visual Red/Orange Banner)
+    if (hasFall !== activeAlert) {
+      setActiveAlert(hasFall);
+    }
 
-        // --- IMMEDIATE SYSTEM ALERT (Background/Locked fallback) ---
-        // 1. Vibrate device (SOS Pattern: ... --- ...)
-        if (navigator.vibrate) {
-          navigator.vibrate([100, 50, 100, 50, 100, 200, 300, 100, 300, 100, 300, 200, 100, 50, 100, 50, 100]);
-        }
+    // Trigger Notifications/Vibration ONLY if there's a NEW unacked fall
+    // We use a ref or check if we were previously cleared to avoid loop
+    if (hasUnackedFall && !alarmAcknowledged) {
+      // If we have an unacked fall, ensure sound plays (reset silence if needed)
+      setAlarmAcknowledged(false);
 
-        // 2. System Notification (Visual + Sound outside browser)
-        if ("Notification" in window && Notification.permission === "granted") {
-          try {
-            new Notification("🚨 FALL DETECTED!", {
-              body: alertRoom
-                ? `Room ${alertRoom.replace('room_', '')} — Patient requires assistance!`
-                : "Connect to Dashboard immediately! Patient requires assistance.",
-              icon: "/vite.png",
-              requireInteraction: true,
-              tag: "fall-alert"
-            });
-          } catch (e) { console.error("Notification failed", e); }
-        }
+      // --- IMMEDIATE SYSTEM ALERT ---
+      if (navigator.vibrate) {
+        navigator.vibrate([100, 50, 100, 50, 100, 200, 300, 100, 300, 100, 300, 200, 100, 50, 100, 50, 100]);
+      }
+
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification("🚨 FALL DETECTED!", {
+            body: alertRoom
+              ? `Room ${alertRoom.replace('room_', '')} — Patient requires assistance!`
+              : "Connect to Dashboard immediately! Patient requires assistance.",
+            icon: "/vite.png",
+            requireInteraction: true,
+            tag: "fall-alert"
+          });
+        } catch (e) { console.error("Notification failed", e); }
       }
     }
   }, [wardData, sensorData, activeAlert]);
 
   // Alarm Control Effect
   useEffect(() => {
-    if (activeAlert && !isMuted && !alarmAcknowledged) {
+    // Play sound if there is an Active Alert AND it hasn't been locally silenced AND there are unacked falls
+    // Actually, simpler: Play sound if there are ANY unacked falls.
+    // But we keep local silence 'alarmAcknowledged' as a "mute for this session" option too.
+
+    let anyUnacked = false;
+    Object.values(wardData).forEach(room => {
+      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
+      const isAck = room.live_status?.acknowledged === true;
+      if (isFall && !isAck) anyUnacked = true;
+    });
+    if (sensorData?.status === 'Fall Down') anyUnacked = true;
+
+    if (activeAlert && anyUnacked && !isMuted && !alarmAcknowledged) {
       alarmRef.current?.play();
     } else {
       alarmRef.current?.stop();
     }
-  }, [activeAlert, isMuted, alarmAcknowledged]);
+  }, [wardData, sensorData, activeAlert, isMuted, alarmAcknowledged]);
+
+
+
 
   // Actions
+  const handleAcknowledge = async (roomKey) => {
+    try {
+      const roomRef = ref(db, `hospital_system/wards/ward_A/${roomKey}/live_status`);
+      await update(roomRef, { acknowledged: true });
+      setAlarmAcknowledged(true); // Stop sound locally immediately
+    } catch (err) {
+      console.error("Ack Error:", err);
+    }
+  };
+
+  const handleAcknowledgeAll = async () => {
+    Object.entries(wardData).forEach(async ([key, room]) => {
+      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
+      const isAck = room.live_status?.acknowledged === true;
+      if (isFall && !isAck) {
+        await handleAcknowledge(key);
+      }
+    });
+    // Also silence global
+    setAlarmAcknowledged(true);
+  };
+
+  const handleResolve = async (roomKey) => {
+    if (!window.confirm("Confirm patient assistance is complete? This will reset the alarm.")) return;
+    try {
+      // 1. Reset Room Status
+      const roomRef = ref(db, `hospital_system/wards/ward_A/${roomKey}`);
+      await update(roomRef, {
+        "live_status/fall_detected": false,
+        "live_status/acknowledged": false,
+        "motion/val": 0
+      });
+
+      // 2. Reset Global Sensor (if applicable)
+      if (sensorData?.status === 'Fall Down') {
+        const sensorRef = ref(db, 'sensor_data');
+        await update(sensorRef, { status: 'Normal' });
+      }
+      setAlarmAcknowledged(false);
+    } catch (err) {
+      console.error("Resolve Error:", err);
+    }
+  };
+
   const handleAssignRoom = async (deviceId, roomKey) => {
     try {
       const deviceRef = ref(db, `hospital_system/devices/${deviceId}/config`);
@@ -607,48 +670,71 @@ export default function App() {
         {activeTab === 'monitor' && (
           <div className="space-y-6">
             {activeAlert && (
-              <div className="p-6 bg-gradient-to-r from-red-600 to-red-800 rounded-2xl shadow-2xl animate-bounce flex flex-wrap items-center justify-between gap-4 text-white">
-                <div className="flex items-center gap-4">
-                  <ShieldAlert size={40} className="animate-pulse" />
-                  <div>
-                    <h2 className="text-2xl font-bold">EMERGENCY ALERT</h2>
-                    <p className="text-red-100">Fall detected! Check indicated rooms immediately.</p>
+              (() => {
+                const unackedRooms = Object.entries(wardData).filter(([k, r]) =>
+                  ((r.live_status?.fall_detected || r.motion?.val > 0) && !r.live_status?.acknowledged) ||
+                  (sensorData?.status === 'Fall Down' && !r.live_status?.acknowledged) // approximate global check
+                );
+                const hasUnacked = unackedRooms.length > 0;
+
+                return (
+                  <div className={cn(
+                    "p-6 rounded-2xl shadow-2xl flex flex-wrap items-center justify-between gap-4 text-white transition-all duration-500",
+                    hasUnacked
+                      ? "bg-gradient-to-r from-red-600 to-red-800 animate-bounce"
+                      : "bg-gradient-to-r from-amber-600 to-amber-800 animate-pulse"
+                  )}>
+                    <div className="flex items-center gap-4">
+                      {hasUnacked ? <ShieldAlert size={40} className="animate-pulse" /> : <Stethoscope size={40} className="animate-bounce" />}
+                      <div>
+                        <h2 className="text-2xl font-bold">{hasUnacked ? "EMERGENCY ALERT" : "ASSISTANCE DIRECTED"}</h2>
+                        <p className={hasUnacked ? "text-red-100" : "text-amber-100"}>
+                          {hasUnacked ? "Fall detected! Immediate attention required." : "Staff notified. Waiting for resolution confirmation."}
+                        </p>
+                      </div>
+                    </div>
+                    {hasUnacked ? (
+                      <button
+                        onClick={handleAcknowledgeAll}
+                        className="px-6 py-3 bg-white text-red-600 font-bold rounded-xl shadow-lg hover:bg-gray-100 transition transform hover:scale-105 flex items-center gap-2"
+                      >
+                        <CheckCircle size={20} /> ACKNOWLEDGE ALL
+                      </button>
+                    ) : (
+                      <div className="flex items-center gap-2 bg-black/20 px-4 py-2 rounded-lg border border-white/20">
+                        <Activity size={18} className="animate-spin" />
+                        <span className="font-bold">Team Responding...</span>
+                      </div>
+                    )}
                   </div>
-                </div>
-                {!alarmAcknowledged ? (
-                  <button
-                    onClick={() => { setAlarmAcknowledged(true); alarmRef.current?.stop(); }}
-                    className="px-6 py-3 bg-white text-red-600 font-bold rounded-xl shadow-lg hover:bg-gray-100 transition transform hover:scale-105"
-                  >
-                    ACKNOWLEDGE
-                  </button>
-                ) : (
-                  <div className="flex items-center gap-2 bg-black/20 px-4 py-2 rounded-lg">
-                    <span>✓ Acknowledged</span>
-                  </div>
-                )}
-              </div>
+                );
+              })()
             )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {Object.entries(wardData).map(([key, room]) => {
-                // Fall detection: check live_status OR motion.val OR global sensor_data
-                const isEmergency = room.live_status?.fall_detected || (room.motion?.val > 0) || (sensorData?.status === 'Fall Down');
-                const isOffline = room.live_status?.online === false; // Only offline if explicitly set to false
+                // Status Logic
+                const isFall = room.live_status?.fall_detected || (room.motion?.val > 0) || (sensorData?.status === 'Fall Down');
+                const isAck = room.live_status?.acknowledged === true;
+                const isEmergency = isFall && !isAck;
+                const isWaiting = isFall && isAck;
+                const isOffline = room.live_status?.online === false;
 
                 return (
                   <div key={key} className={cn(
                     "relative overflow-hidden rounded-3xl border transition-all duration-300 group",
                     isEmergency
                       ? "bg-red-900/40 border-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] scale-[1.02]"
-                      : "bg-slate-900/40 border-slate-800 hover:border-slate-700 hover:-translate-y-1 hover:shadow-xl backdrop-blur-sm"
+                      : isWaiting
+                        ? "bg-amber-900/40 border-amber-500 shadow-[0_0_20px_rgba(245,158,11,0.2)]"
+                        : "bg-slate-900/40 border-slate-800 hover:border-slate-700 hover:-translate-y-1 hover:shadow-xl backdrop-blur-sm"
                   )}>
                     {/* Card Header */}
                     <div className="p-6 border-b border-white/5 flex justify-between items-start">
                       <div className="flex items-center gap-4">
                         <div className={cn(
                           "w-14 h-14 rounded-2xl flex items-center justify-center text-white font-bold text-xl shadow-lg transition-transform group-hover:scale-110",
-                          isEmergency ? "bg-red-600" : "bg-slate-800"
+                          isEmergency ? "bg-red-600 animate-bounce" : isWaiting ? "bg-amber-500 animate-pulse" : "bg-slate-800"
                         )}>
                           {key.replace('room_', '')}
                         </div>
@@ -666,442 +752,463 @@ export default function App() {
                         </div>
                       </div>
                       {isEmergency && <ShieldAlert className="text-red-500 animate-pulse" size={28} />}
+                      {isWaiting && <Stethoscope className="text-amber-500 animate-pulse" size={28} />}
                     </div>
 
                     {/* Card Body */}
                     <div className="p-6 space-y-4">
-                      <div className="flex items-center justify-between p-3 bg-slate-950/30 rounded-xl">
-                        <div className="flex items-center gap-3 text-slate-400">
-                          <Activity size={18} />
-                          <span className="text-sm">Status</span>
-                        </div>
+                      <div className="flex justify-between items-center text-sm text-slate-400">
+                        <span>Status</span>
                         <span className={cn(
-                          "font-bold text-sm px-3 py-1 rounded-full",
-                          isEmergency ? "bg-red-500/20 text-red-500 animate-pulse" : "bg-green-500/20 text-green-500"
+                          "font-bold text-sm px-3 py-1 rounded-full flex items-center gap-2",
+                          isEmergency
+                            ? "bg-red-500/20 text-red-500 animate-pulse"
+                            : isWaiting
+                              ? "bg-amber-500/20 text-amber-500"
+                              : "bg-green-500/20 text-green-500"
                         )}>
-                          {isEmergency ? "🚨 FALL DETECTED" : "Normal"}
+                          {isEmergency && <AlertTriangle size={14} />}
+                          {isWaiting && <Stethoscope size={14} />}
+                          {isEmergency ? "🚨 FALL DETECTED" : isWaiting ? "WAITING FOR HELP" : "Normal"}
                         </span>
                       </div>
-                    </div>
 
-                    {/* Card Footer */}
-                    <div className="p-4 bg-slate-950/50 flex gap-3">
-                      <button className={cn(
-                        "flex-1 py-3 rounded-xl font-bold text-sm transition-all shadow-lg",
-                        isEmergency
-                          ? "bg-red-600 text-white hover:bg-red-500"
-                          : "bg-slate-800 text-slate-300 hover:bg-slate-700"
-                      )}>
-                        {isEmergency ? "RESPOND NOW" : "View Details"}
-                      </button>
+                      {/* Action Buttons */}
+                      <div className="pt-2">
+                        {isEmergency ? (
+                          <button
+                            onClick={() => handleAcknowledge(key)}
+                            className="w-full py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl shadow-lg shadow-red-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
+                          >
+                            <CheckCircle size={18} /> Acknowledge Alarm
+                          </button>
+                        ) : isWaiting ? (
+                          <button
+                            onClick={() => handleResolve(key)}
+                            className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl shadow-lg shadow-amber-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
+                          >
+                            <XCircle size={18} /> Confirm Assistance Complete
+                          </button>
+                        ) : (
+                          <button className="w-full py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-xl flex items-center justify-center gap-2 transition-all border border-slate-700 hover:border-slate-600">
+                            Details
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
+
                 );
               })}
             </div>
           </div>
-        )}
+        )
+        }
 
         {/* --- Devices Tab: Pairing & Management --- */}
-        {activeTab === 'devices' && (() => {
-          // === Group devices by assigned room ===
-          const roomPairings = {}; // { room_301: { cam: [...], monitor: [...] } }
-          const pendingDevices = []; // devices not yet assigned
+        {
+          activeTab === 'devices' && (() => {
+            // === Group devices by assigned room ===
+            const roomPairings = {}; // { room_301: { cam: [...], monitor: [...] } }
+            const pendingDevices = []; // devices not yet assigned
 
-          Object.entries(devices).forEach(([deviceId, device]) => {
-            const room = device.config?.assigned_room;
-            const isPaired = room && room !== 'none';
-            const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
+            Object.entries(devices).forEach(([deviceId, device]) => {
+              const room = device.config?.assigned_room;
+              const isPaired = room && room !== 'none';
+              const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
 
-            if (isPaired) {
-              if (!roomPairings[room]) roomPairings[room] = { cam: [], monitor: [] };
-              if (isCAM) {
-                roomPairings[room].cam.push({ id: deviceId, ...device });
+              if (isPaired) {
+                if (!roomPairings[room]) roomPairings[room] = { cam: [], monitor: [] };
+                if (isCAM) {
+                  roomPairings[room].cam.push({ id: deviceId, ...device });
+                } else {
+                  roomPairings[room].monitor.push({ id: deviceId, ...device });
+                }
               } else {
-                roomPairings[room].monitor.push({ id: deviceId, ...device });
+                pendingDevices.push({ id: deviceId, ...device });
               }
-            } else {
-              pendingDevices.push({ id: deviceId, ...device });
-            }
-          });
+            });
 
-          const pairedRooms = Object.entries(roomPairings);
+            const pairedRooms = Object.entries(roomPairings);
 
-          return (
-            <div className="space-y-6 animate-in fade-in zoom-in duration-300">
-              {/* Header */}
-              <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
-                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
-                  <div>
-                    <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                      <Cpu className="text-blue-400" />
-                      🔌 Device Pairing & Management
-                    </h2>
-                    <p className="text-slate-400 text-sm mt-1">
-                      Plug & Play — ESP32_S3_CAM + Nurse_Monitor auto-pair per room
-                    </p>
+            return (
+              <div className="space-y-6 animate-in fade-in zoom-in duration-300">
+                {/* Header */}
+                <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+                    <div>
+                      <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                        <Cpu className="text-blue-400" />
+                        🔌 Device Pairing & Management
+                      </h2>
+                      <p className="text-slate-400 text-sm mt-1">
+                        Plug & Play — ESP32_S3_CAM + Nurse_Monitor auto-pair per room
+                      </p>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-full text-xs font-bold border border-emerald-500/20 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                        {pairedRooms.filter(([, g]) => g.cam.length > 0 && g.monitor.length > 0).length} Complete
+                      </span>
+                      <span className="bg-cyan-500/10 text-cyan-400 px-3 py-1.5 rounded-full text-xs font-bold border border-cyan-500/20 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-cyan-500" />
+                        {pairedRooms.filter(([, g]) => g.cam.length === 0 || g.monitor.length === 0).length} Partial
+                      </span>
+                      <span className="bg-amber-500/10 text-amber-400 px-3 py-1.5 rounded-full text-xs font-bold border border-amber-500/20 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                        {pendingDevices.length} Pending
+                      </span>
+                      <span className="bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-full text-xs font-bold border border-blue-500/20">
+                        {Object.keys(devices).length} Total
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex gap-2 flex-wrap">
-                    <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-full text-xs font-bold border border-emerald-500/20 flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                      {pairedRooms.filter(([, g]) => g.cam.length > 0 && g.monitor.length > 0).length} Complete
-                    </span>
-                    <span className="bg-cyan-500/10 text-cyan-400 px-3 py-1.5 rounded-full text-xs font-bold border border-cyan-500/20 flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-cyan-500" />
-                      {pairedRooms.filter(([, g]) => g.cam.length === 0 || g.monitor.length === 0).length} Partial
-                    </span>
-                    <span className="bg-amber-500/10 text-amber-400 px-3 py-1.5 rounded-full text-xs font-bold border border-amber-500/20 flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-amber-500" />
-                      {pendingDevices.length} Pending
-                    </span>
-                    <span className="bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-full text-xs font-bold border border-blue-500/20">
-                      {Object.keys(devices).length} Total
-                    </span>
-                  </div>
-                </div>
 
-                {/* ====== PAIRED ROOM CARDS ====== */}
-                {pairedRooms.length > 0 && (
-                  <div className="mb-2">
-                    <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                      <Link2 size={14} /> Paired Rooms ({pairedRooms.length})
-                    </h3>
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-                      {pairedRooms.map(([roomKey, group]) => {
-                        const roomData = wardData[roomKey];
-                        const isFallDetected = roomData?.live_status?.fall_detected || (roomData?.motion?.val > 0) || (sensorData?.status === 'Fall Down') || false;
-                        const patientName = roomData?.patient_info?.name || 'Unknown Patient';
-                        const isComplete = group.cam.length > 0 && group.monitor.length > 0;
-                        const allDevices = [...group.cam, ...group.monitor];
+                  {/* ====== PAIRED ROOM CARDS ====== */}
+                  {pairedRooms.length > 0 && (
+                    <div className="mb-2">
+                      <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                        <Link2 size={14} /> Paired Rooms ({pairedRooms.length})
+                      </h3>
+                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+                        {pairedRooms.map(([roomKey, group]) => {
+                          const roomData = wardData[roomKey];
+                          const isFall = roomData?.live_status?.fall_detected || (roomData?.motion?.val > 0) || (sensorData?.status === 'Fall Down') || false;
+                          const isAck = roomData?.live_status?.acknowledged === true && isFall;
+                          const isFallDetected = isFall && !isAck; // Only show RED if not acked
+                          const patientName = roomData?.patient_info?.name || 'Unknown Patient';
+                          const isComplete = group.cam.length > 0 && group.monitor.length > 0;
+                          const allDevices = [...group.cam, ...group.monitor];
 
-                        return (
-                          <div
-                            key={roomKey}
-                            className={cn(
-                              "rounded-2xl border-2 overflow-hidden transition-all duration-500",
-                              isFallDetected
-                                ? "border-red-500/60 bg-red-950/20 shadow-[0_0_25px_rgba(220,38,38,0.2)]"
-                                : isComplete
-                                  ? "border-emerald-500/30 bg-slate-800/40 hover:border-emerald-400/50"
-                                  : "border-cyan-500/30 bg-slate-800/40 hover:border-cyan-400/50"
-                            )}
-                          >
-                            {/* Room Header */}
-                            <div className={cn(
-                              "px-5 py-3 flex items-center justify-between border-b",
-                              isFallDetected ? "bg-red-900/30 border-red-800/50" : "bg-slate-900/60 border-slate-700/50"
-                            )}>
-                              <div className="flex items-center gap-3">
-                                <div className={cn(
-                                  "w-10 h-10 rounded-xl flex items-center justify-center text-base font-bold",
-                                  isFallDetected ? "bg-red-600 text-white animate-pulse" : "bg-slate-700 text-white"
-                                )}>
-                                  {roomKey.replace('room_', '')}
-                                </div>
-                                <div>
-                                  <h4 className="text-sm font-bold text-white">{patientName}</h4>
-                                  <p className={cn(
-                                    "text-[11px] flex items-center gap-1",
-                                    isFallDetected ? "text-red-400 font-bold" : "text-emerald-400"
+                          return (
+                            <div
+                              key={roomKey}
+                              className={cn(
+                                "rounded-2xl border-2 overflow-hidden transition-all duration-500",
+                                isFallDetected
+                                  ? "border-red-500/60 bg-red-950/20 shadow-[0_0_25px_rgba(220,38,38,0.2)]"
+                                  : isComplete
+                                    ? "border-emerald-500/30 bg-slate-800/40 hover:border-emerald-400/50"
+                                    : "border-cyan-500/30 bg-slate-800/40 hover:border-cyan-400/50"
+                              )}
+                            >
+                              {/* Room Header */}
+                              <div className={cn(
+                                "px-5 py-3 flex items-center justify-between border-b",
+                                isFallDetected ? "bg-red-900/30 border-red-800/50" : "bg-slate-900/60 border-slate-700/50"
+                              )}>
+                                <div className="flex items-center gap-3">
+                                  <div className={cn(
+                                    "w-10 h-10 rounded-xl flex items-center justify-center text-base font-bold",
+                                    isFallDetected ? "bg-red-600 text-white animate-pulse" : "bg-slate-700 text-white"
                                   )}>
-                                    <span className={cn("w-1.5 h-1.5 rounded-full", isFallDetected ? "bg-red-500 animate-pulse" : "bg-emerald-500")} />
-                                    {isFallDetected ? '⚠ FALL DETECTED' : 'Monitoring Active'}
+                                    {roomKey.replace('room_', '')}
+                                  </div>
+                                  <div>
+                                    <h4 className="text-sm font-bold text-white">{patientName}</h4>
+                                    <p className={cn(
+                                      "text-[11px] flex items-center gap-1",
+                                      isFallDetected ? "text-red-400 font-bold" : "text-emerald-400"
+                                    )}>
+                                      <span className={cn("w-1.5 h-1.5 rounded-full", isFallDetected ? "bg-red-500 animate-pulse" : "bg-emerald-500")} />
+                                      {isFallDetected ? '⚠ FALL DETECTED' : 'Monitoring Active'}
+                                    </p>
+                                  </div>
+                                </div>
+                                <span className={cn(
+                                  "px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider",
+                                  isComplete
+                                    ? "bg-emerald-900/60 text-emerald-300 border border-emerald-500/30"
+                                    : "bg-cyan-900/60 text-cyan-300 border border-cyan-500/30"
+                                )}>
+                                  {isComplete ? '✓ COMPLETE' : '◐ PARTIAL'}
+                                </span>
+                              </div>
+
+                              {/* Devices Row */}
+                              <div className="p-4">
+                                <div className="flex flex-col sm:flex-row items-stretch gap-3">
+                                  {/* Camera Device(s) */}
+                                  <div className={cn(
+                                    "flex-1 p-3.5 rounded-xl border transition-all",
+                                    group.cam.length > 0
+                                      ? "bg-slate-900/50 border-blue-500/20"
+                                      : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
+                                  )}>
+                                    <div className="flex items-center gap-2 mb-2">
+                                      <Camera size={14} className="text-blue-400" />
+                                      <span className="text-[11px] font-bold text-blue-400 uppercase tracking-wider">Camera</span>
+                                      {group.cam.length > 0 && (
+                                        <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
+                                      )}
+                                    </div>
+                                    {group.cam.length > 0 ? group.cam.map(d => {
+                                      const camOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
+                                      return (
+                                        <div key={d.id} className="space-y-1">
+                                          <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
+                                          <p className="text-[11px] text-slate-500">{d.info?.model || 'ESP32-S3-CAM'}</p>
+                                          <div className="flex justify-between text-[11px] text-slate-400">
+                                            <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
+                                            <span className={camOnline ? 'text-emerald-400' : 'text-slate-500'}>{camOnline ? '● On' : '○ Off'}</span>
+                                          </div>
+                                          {d.info?.ip && (
+                                            <a href={`http://${d.info.ip}/capture`} target="_blank" rel="noopener noreferrer"
+                                              className="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-1 mt-1">
+                                              <Camera size={9} /> Stream <ExternalLink size={8} />
+                                            </a>
+                                          )}
+                                        </div>
+                                      );
+                                    }) : (
+                                      <p className="text-[11px] text-slate-600 italic">No camera assigned</p>
+                                    )}
+                                  </div>
+
+                                  {/* Pairing Connector */}
+                                  <div className="flex sm:flex-col items-center justify-center gap-1 py-1 sm:py-0 sm:px-1">
+                                    <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
+                                    <div className={cn(
+                                      "w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all",
+                                      isComplete
+                                        ? isFallDetected
+                                          ? "bg-red-600 border-red-500 text-white animate-pulse shadow-[0_0_12px_rgba(220,38,38,0.5)]"
+                                          : "bg-emerald-600/80 border-emerald-500/50 text-white shadow-[0_0_8px_rgba(16,185,129,0.3)]"
+                                        : "bg-slate-700 border-slate-600 text-slate-400"
+                                    )}>
+                                      {isFallDetected ? <ShieldAlert size={14} /> : isComplete ? <Link2 size={14} /> : '?'}
+                                    </div>
+                                    <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
+                                  </div>
+
+                                  {/* Monitor Device(s) */}
+                                  <div className={cn(
+                                    "flex-1 p-3.5 rounded-xl border transition-all",
+                                    group.monitor.length > 0
+                                      ? "bg-slate-900/50 border-violet-500/20"
+                                      : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
+                                  )}>
+                                    <div className="flex items-center gap-2 mb-2">
+                                      <Monitor size={14} className="text-violet-400" />
+                                      <span className="text-[11px] font-bold text-violet-400 uppercase tracking-wider">Nurse Monitor</span>
+                                      {group.monitor.length > 0 && (
+                                        <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
+                                      )}
+                                    </div>
+                                    {group.monitor.length > 0 ? group.monitor.map(d => {
+                                      const monOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
+                                      return (
+                                        <div key={d.id} className="space-y-1">
+                                          <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
+                                          <p className="text-[11px] text-slate-500">{d.info?.model || 'Nurse_Monitor_V2'}</p>
+                                          <div className="flex justify-between text-[11px] text-slate-400">
+                                            <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
+                                            <span className={monOnline ? 'text-emerald-400' : 'text-slate-500'}>{monOnline ? '● On' : '○ Off'}</span>
+                                          </div>
+                                        </div>
+                                      );
+                                    }) : (
+                                      <p className="text-[11px] text-slate-600 italic">No monitor assigned</p>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {/* Room Actions */}
+                                <div className="flex gap-2 mt-3 pt-3 border-t border-slate-700/50">
+                                  {allDevices.map(d => (
+                                    <button
+                                      key={`edit-${d.id}`}
+                                      onClick={() => setEditingDevice(d.id)}
+                                      className="flex-1 py-1.5 bg-blue-600/15 text-blue-400 hover:bg-blue-600/25 rounded-lg transition text-[11px] font-medium flex items-center justify-center gap-1 truncate"
+                                      title={`Edit ${d.id}`}
+                                    >
+                                      <Settings size={10} /> {d.id.substring(0, 12)}
+                                    </button>
+                                  ))}
+                                  <button
+                                    onClick={() => {
+                                      if (window.confirm(`Unlink all devices from ${roomKey.replace('room_', 'Room ')}?`)) {
+                                        allDevices.forEach(d => handleUnlink(d.id));
+                                      }
+                                    }}
+                                    className="py-1.5 px-3 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition text-[11px]"
+                                    title="Unlink all from room"
+                                  >
+                                    <Unplug size={13} />
+                                  </button>
+                                </div>
+
+                                {/* Inline Edit (if editing any device in this room) */}
+                                {allDevices.some(d => editingDevice === d.id) && (() => {
+                                  const d = allDevices.find(d => editingDevice === d.id);
+                                  return (
+                                    <div className="mt-3 p-4 bg-slate-950/60 rounded-xl border border-blue-500/20 space-y-3">
+                                      <div className="flex items-center gap-2">
+                                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-500/30">EDITING</span>
+                                        <span className="text-xs font-mono text-blue-400">{d.id}</span>
+                                      </div>
+                                      <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                          <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
+                                          <input type="text" defaultValue={roomKey.replace('room_', '')} id={`edit-room-${d.id}`}
+                                            className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="301" />
+                                        </div>
+                                        <div>
+                                          <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
+                                          <input type="text" defaultValue={d.config?.patient_name || roomData?.patient_info?.name || ''} id={`edit-patient-${d.id}`}
+                                            className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient" />
+                                        </div>
+                                      </div>
+                                      <div className="flex gap-2">
+                                        <button onClick={() => {
+                                          handleSaveConfig(d.id, document.getElementById(`edit-room-${d.id}`).value, document.getElementById(`edit-patient-${d.id}`).value);
+                                        }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
+                                          <Save size={14} /> Save
+                                        </button>
+                                        <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">Cancel</button>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ====== PENDING (UNPAIRED) DEVICES ====== */}
+                  {pendingDevices.length > 0 && (
+                    <div className={pairedRooms.length > 0 ? "mt-6" : ""}>
+                      <h3 className="text-sm font-bold text-amber-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                        <AlertTriangle size={14} /> Pending Devices ({pendingDevices.length})
+                      </h3>
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {pendingDevices.map((device) => {
+                          const deviceId = device.id;
+                          const isEditing = editingDevice === deviceId;
+                          const isOnline = (Date.now() - (device.status?.last_seen || 0)) < 60000;
+                          const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
+
+                          return (
+                            <div
+                              key={deviceId}
+                              className="p-4 rounded-xl border-2 border-amber-500/30 bg-slate-800/40 hover:border-amber-400/50 transition-all duration-300"
+                            >
+                              <div className="flex justify-between items-start mb-3">
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
+                                    <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-900/60 text-amber-300 border border-amber-500/30">
+                                      PENDING
+                                    </span>
+                                  </div>
+                                  <h3 className="text-sm font-mono font-bold text-blue-400 truncate">{deviceId}</h3>
+                                  <p className="text-xs text-slate-500 mt-0.5">
+                                    {device.info?.model || 'Unknown'}
+                                    {device.info?.type ? ` • ${device.info.type}` : ''}
                                   </p>
                                 </div>
-                              </div>
-                              <span className={cn(
-                                "px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider",
-                                isComplete
-                                  ? "bg-emerald-900/60 text-emerald-300 border border-emerald-500/30"
-                                  : "bg-cyan-900/60 text-cyan-300 border border-cyan-500/30"
-                              )}>
-                                {isComplete ? '✓ COMPLETE' : '◐ PARTIAL'}
-                              </span>
-                            </div>
-
-                            {/* Devices Row */}
-                            <div className="p-4">
-                              <div className="flex flex-col sm:flex-row items-stretch gap-3">
-                                {/* Camera Device(s) */}
-                                <div className={cn(
-                                  "flex-1 p-3.5 rounded-xl border transition-all",
-                                  group.cam.length > 0
-                                    ? "bg-slate-900/50 border-blue-500/20"
-                                    : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
-                                )}>
-                                  <div className="flex items-center gap-2 mb-2">
-                                    <Camera size={14} className="text-blue-400" />
-                                    <span className="text-[11px] font-bold text-blue-400 uppercase tracking-wider">Camera</span>
-                                    {group.cam.length > 0 && (
-                                      <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
-                                    )}
-                                  </div>
-                                  {group.cam.length > 0 ? group.cam.map(d => {
-                                    const camOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
-                                    return (
-                                      <div key={d.id} className="space-y-1">
-                                        <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
-                                        <p className="text-[11px] text-slate-500">{d.info?.model || 'ESP32-S3-CAM'}</p>
-                                        <div className="flex justify-between text-[11px] text-slate-400">
-                                          <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
-                                          <span className={camOnline ? 'text-emerald-400' : 'text-slate-500'}>{camOnline ? '● On' : '○ Off'}</span>
-                                        </div>
-                                        {d.info?.ip && (
-                                          <a href={`http://${d.info.ip}/capture`} target="_blank" rel="noopener noreferrer"
-                                            className="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-1 mt-1">
-                                            <Camera size={9} /> Stream <ExternalLink size={8} />
-                                          </a>
-                                        )}
-                                      </div>
-                                    );
-                                  }) : (
-                                    <p className="text-[11px] text-slate-600 italic">No camera assigned</p>
-                                  )}
-                                </div>
-
-                                {/* Pairing Connector */}
-                                <div className="flex sm:flex-col items-center justify-center gap-1 py-1 sm:py-0 sm:px-1">
-                                  <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
-                                  <div className={cn(
-                                    "w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all",
-                                    isComplete
-                                      ? isFallDetected
-                                        ? "bg-red-600 border-red-500 text-white animate-pulse shadow-[0_0_12px_rgba(220,38,38,0.5)]"
-                                        : "bg-emerald-600/80 border-emerald-500/50 text-white shadow-[0_0_8px_rgba(16,185,129,0.3)]"
-                                      : "bg-slate-700 border-slate-600 text-slate-400"
-                                  )}>
-                                    {isFallDetected ? <ShieldAlert size={14} /> : isComplete ? <Link2 size={14} /> : '?'}
-                                  </div>
-                                  <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
-                                </div>
-
-                                {/* Monitor Device(s) */}
-                                <div className={cn(
-                                  "flex-1 p-3.5 rounded-xl border transition-all",
-                                  group.monitor.length > 0
-                                    ? "bg-slate-900/50 border-violet-500/20"
-                                    : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
-                                )}>
-                                  <div className="flex items-center gap-2 mb-2">
-                                    <Monitor size={14} className="text-violet-400" />
-                                    <span className="text-[11px] font-bold text-violet-400 uppercase tracking-wider">Nurse Monitor</span>
-                                    {group.monitor.length > 0 && (
-                                      <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
-                                    )}
-                                  </div>
-                                  {group.monitor.length > 0 ? group.monitor.map(d => {
-                                    const monOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
-                                    return (
-                                      <div key={d.id} className="space-y-1">
-                                        <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
-                                        <p className="text-[11px] text-slate-500">{d.info?.model || 'Nurse_Monitor_V2'}</p>
-                                        <div className="flex justify-between text-[11px] text-slate-400">
-                                          <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
-                                          <span className={monOnline ? 'text-emerald-400' : 'text-slate-500'}>{monOnline ? '● On' : '○ Off'}</span>
-                                        </div>
-                                      </div>
-                                    );
-                                  }) : (
-                                    <p className="text-[11px] text-slate-600 italic">No monitor assigned</p>
-                                  )}
+                                <div className="flex items-center gap-2 ml-2">
+                                  {isCAM ? <Camera size={14} className="text-blue-400" /> : <Monitor size={14} className="text-violet-400" />}
+                                  <span className={cn("w-2 h-2 rounded-full", isOnline ? "bg-emerald-500" : "bg-slate-600")} />
                                 </div>
                               </div>
 
-                              {/* Room Actions */}
-                              <div className="flex gap-2 mt-3 pt-3 border-t border-slate-700/50">
-                                {allDevices.map(d => (
-                                  <button
-                                    key={`edit-${d.id}`}
-                                    onClick={() => setEditingDevice(d.id)}
-                                    className="flex-1 py-1.5 bg-blue-600/15 text-blue-400 hover:bg-blue-600/25 rounded-lg transition text-[11px] font-medium flex items-center justify-center gap-1 truncate"
-                                    title={`Edit ${d.id}`}
-                                  >
-                                    <Settings size={10} /> {d.id.substring(0, 12)}
-                                  </button>
-                                ))}
-                                <button
-                                  onClick={() => {
-                                    if (window.confirm(`Unlink all devices from ${roomKey.replace('room_', 'Room ')}?`)) {
-                                      allDevices.forEach(d => handleUnlink(d.id));
-                                    }
-                                  }}
-                                  className="py-1.5 px-3 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition text-[11px]"
-                                  title="Unlink all from room"
-                                >
-                                  <Unplug size={13} />
-                                </button>
-                              </div>
-
-                              {/* Inline Edit (if editing any device in this room) */}
-                              {allDevices.some(d => editingDevice === d.id) && (() => {
-                                const d = allDevices.find(d => editingDevice === d.id);
-                                return (
-                                  <div className="mt-3 p-4 bg-slate-950/60 rounded-xl border border-blue-500/20 space-y-3">
-                                    <div className="flex items-center gap-2">
-                                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-500/30">EDITING</span>
-                                      <span className="text-xs font-mono text-blue-400">{d.id}</span>
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                      <div>
-                                        <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
-                                        <input type="text" defaultValue={roomKey.replace('room_', '')} id={`edit-room-${d.id}`}
-                                          className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="301" />
-                                      </div>
-                                      <div>
-                                        <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
-                                        <input type="text" defaultValue={d.config?.patient_name || roomData?.patient_info?.name || ''} id={`edit-patient-${d.id}`}
-                                          className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient" />
-                                      </div>
-                                    </div>
-                                    <div className="flex gap-2">
-                                      <button onClick={() => {
-                                        handleSaveConfig(d.id, document.getElementById(`edit-room-${d.id}`).value, document.getElementById(`edit-patient-${d.id}`).value);
-                                      }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
-                                        <Save size={14} /> Save
-                                      </button>
-                                      <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">Cancel</button>
-                                    </div>
-                                  </div>
-                                );
-                              })()}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* ====== PENDING (UNPAIRED) DEVICES ====== */}
-                {pendingDevices.length > 0 && (
-                  <div className={pairedRooms.length > 0 ? "mt-6" : ""}>
-                    <h3 className="text-sm font-bold text-amber-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                      <AlertTriangle size={14} /> Pending Devices ({pendingDevices.length})
-                    </h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                      {pendingDevices.map((device) => {
-                        const deviceId = device.id;
-                        const isEditing = editingDevice === deviceId;
-                        const isOnline = (Date.now() - (device.status?.last_seen || 0)) < 60000;
-                        const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
-
-                        return (
-                          <div
-                            key={deviceId}
-                            className="p-4 rounded-xl border-2 border-amber-500/30 bg-slate-800/40 hover:border-amber-400/50 transition-all duration-300"
-                          >
-                            <div className="flex justify-between items-start mb-3">
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 mb-1">
-                                  <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
-                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-900/60 text-amber-300 border border-amber-500/30">
-                                    PENDING
+                              <div className="space-y-1.5 mb-3 text-xs text-slate-400">
+                                <div className="flex justify-between">
+                                  <span>Type</span>
+                                  <span className={isCAM ? "text-blue-400 font-medium" : "text-violet-400 font-medium"}>
+                                    {isCAM ? '📷 Camera' : '🖥️ Monitor'}
                                   </span>
                                 </div>
-                                <h3 className="text-sm font-mono font-bold text-blue-400 truncate">{deviceId}</h3>
-                                <p className="text-xs text-slate-500 mt-0.5">
-                                  {device.info?.model || 'Unknown'}
-                                  {device.info?.type ? ` • ${device.info.type}` : ''}
-                                </p>
+                                <div className="flex justify-between">
+                                  <span>IP</span>
+                                  <span className="font-mono text-slate-300">{device.info?.ip || 'N/A'}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span>Network</span>
+                                  <span className={isOnline ? "text-emerald-400" : "text-slate-500"}>
+                                    {isOnline ? '● Online' : '○ Offline'}
+                                  </span>
+                                </div>
                               </div>
-                              <div className="flex items-center gap-2 ml-2">
-                                {isCAM ? <Camera size={14} className="text-blue-400" /> : <Monitor size={14} className="text-violet-400" />}
-                                <span className={cn("w-2 h-2 rounded-full", isOnline ? "bg-emerald-500" : "bg-slate-600")} />
-                              </div>
-                            </div>
 
-                            <div className="space-y-1.5 mb-3 text-xs text-slate-400">
-                              <div className="flex justify-between">
-                                <span>Type</span>
-                                <span className={isCAM ? "text-blue-400 font-medium" : "text-violet-400 font-medium"}>
-                                  {isCAM ? '📷 Camera' : '🖥️ Monitor'}
-                                </span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span>IP</span>
-                                <span className="font-mono text-slate-300">{device.info?.ip || 'N/A'}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span>Network</span>
-                                <span className={isOnline ? "text-emerald-400" : "text-slate-500"}>
-                                  {isOnline ? '● Online' : '○ Offline'}
-                                </span>
-                              </div>
-                            </div>
-
-                            {isEditing ? (
-                              <div className="space-y-3 p-3 bg-slate-950/50 rounded-lg border border-slate-700">
-                                <div>
-                                  <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
-                                  <input type="text" defaultValue="" id={`edit-room-${deviceId}`}
-                                    className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="e.g. 301" />
-                                </div>
-                                <div>
-                                  <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
-                                  <input type="text" defaultValue="" id={`edit-patient-${deviceId}`}
-                                    className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient Name" />
-                                </div>
-                                <div className="flex gap-2">
-                                  <button onClick={() => {
-                                    handleSaveConfig(deviceId, document.getElementById(`edit-room-${deviceId}`).value, document.getElementById(`edit-patient-${deviceId}`).value);
-                                  }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
-                                    <Save size={14} /> Pair & Save
-                                  </button>
-                                  <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">
-                                    Cancel
-                                  </button>
-                                </div>
-                              </div>
-                            ) : (
-                              <div className="space-y-2">
-                                <div>
-                                  <label className="block text-[11px] text-slate-500 mb-1">Assign to Room:</label>
-                                  <div className="relative">
-                                    <select
-                                      value="none"
-                                      onChange={(e) => handleAssignRoom(deviceId, e.target.value)}
-                                      className="appearance-none w-full bg-slate-950 border border-slate-700 text-white py-2 px-3 pr-8 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
-                                    >
-                                      <option value="none">-- Select Room --</option>
-                                      {getRoomOptions().map(opt => (
-                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                      ))}
-                                    </select>
-                                    <Settings size={14} className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" />
+                              {isEditing ? (
+                                <div className="space-y-3 p-3 bg-slate-950/50 rounded-lg border border-slate-700">
+                                  <div>
+                                    <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
+                                    <input type="text" defaultValue="" id={`edit-room-${deviceId}`}
+                                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="e.g. 301" />
+                                  </div>
+                                  <div>
+                                    <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
+                                    <input type="text" defaultValue="" id={`edit-patient-${deviceId}`}
+                                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient Name" />
+                                  </div>
+                                  <div className="flex gap-2">
+                                    <button onClick={() => {
+                                      handleSaveConfig(deviceId, document.getElementById(`edit-room-${deviceId}`).value, document.getElementById(`edit-patient-${deviceId}`).value);
+                                    }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
+                                      <Save size={14} /> Pair & Save
+                                    </button>
+                                    <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">
+                                      Cancel
+                                    </button>
                                   </div>
                                 </div>
-                                <button
-                                  onClick={() => setEditingDevice(deviceId)}
-                                  className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
-                                >
-                                  <Settings size={12} /> Manual Pair
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
+                              ) : (
+                                <div className="space-y-2">
+                                  <div>
+                                    <label className="block text-[11px] text-slate-500 mb-1">Assign to Room:</label>
+                                    <div className="relative">
+                                      <select
+                                        value="none"
+                                        onChange={(e) => handleAssignRoom(deviceId, e.target.value)}
+                                        className="appearance-none w-full bg-slate-950 border border-slate-700 text-white py-2 px-3 pr-8 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+                                      >
+                                        <option value="none">-- Select Room --</option>
+                                        {getRoomOptions().map(opt => (
+                                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                        ))}
+                                      </select>
+                                      <Settings size={14} className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" />
+                                    </div>
+                                  </div>
+                                  <button
+                                    onClick={() => setEditingDevice(deviceId)}
+                                    className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
+                                  >
+                                    <Settings size={12} /> Manual Pair
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
 
-                {/* Empty State */}
-                {Object.keys(devices).length === 0 && (
-                  <div className="text-center py-16 text-slate-500">
-                    <Cpu size={48} className="mx-auto mb-4 opacity-30" />
-                    <p className="text-lg font-medium">No devices found</p>
-                    <p className="text-sm mt-1">Power on your ESP8266 or ESP32-S3-CAM to see them here.</p>
-                  </div>
-                )}
+                  {/* Empty State */}
+                  {Object.keys(devices).length === 0 && (
+                    <div className="text-center py-16 text-slate-500">
+                      <Cpu size={48} className="mx-auto mb-4 opacity-30" />
+                      <p className="text-lg font-medium">No devices found</p>
+                      <p className="text-sm mt-1">Power on your ESP8266 or ESP32-S3-CAM to see them here.</p>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
-          );
-        })()}
+            );
+          })()
+        }
 
 
-      </main>
+      </main >
 
       <SpeedInsights />
-    </div>
+    </div >
   );
 }
