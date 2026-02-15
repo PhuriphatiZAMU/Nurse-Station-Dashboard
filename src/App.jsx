@@ -247,6 +247,7 @@ export default function App() {
   // Data State
   const [wardData, setWardData] = useState({});
   const [devices, setDevices] = useState({});
+  const [sensorData, setSensorData] = useState({}); // /sensor_data (global fall status from ESP)
   const [editingDevice, setEditingDevice] = useState(null);
 
   const handleSaveConfig = async (deviceId, roomId, patientName) => {
@@ -301,6 +302,7 @@ export default function App() {
   useEffect(() => {
     let unsubscribeWards = null;
     let unsubscribeDevices = null;
+    let unsubscribeSensor = null;
 
     const setupListeners = () => {
       // 1. Listen to Ward Data
@@ -322,6 +324,12 @@ export default function App() {
       unsubscribeDevices = onValue(devicesRef, (snapshot) => {
         setDevices(snapshot.val() || {});
       }, (err) => console.error("Device Listen Error:", err));
+
+      // 3. Listen to sensor_data (global ESP fall status)
+      const sensorRef = ref(db, 'sensor_data');
+      unsubscribeSensor = onValue(sensorRef, (snapshot) => {
+        setSensorData(snapshot.val() || {});
+      }, (err) => console.error("Sensor Listen Error:", err));
     };
 
     // Authenticate (Anonymous)
@@ -362,21 +370,44 @@ export default function App() {
     return () => {
       if (unsubscribeWards) unsubscribeWards();
       if (unsubscribeDevices) unsubscribeDevices();
+      if (unsubscribeSensor) unsubscribeSensor();
     };
   }, []); // Run once on mount
 
   // Alert Logic based on Data
+  // Checks THREE possible fall indicators:
+  //   1. room.live_status?.fall_detected (ideal structure)
+  //   2. room.motion?.val > 0 (ESP32-S3-CAM sends motion.val = 1 on fall)
+  //   3. sensorData.status === 'Fall Down' (global /sensor_data from ESP)
   useEffect(() => {
     let emergency = false;
-    Object.values(wardData).forEach(room => {
-      if (room.live_status?.fall_detected) emergency = true;
+    let alertRoom = null;
+
+    // Check ward rooms for fall detection
+    Object.entries(wardData).forEach(([roomKey, room]) => {
+      // Method 1: live_status.fall_detected (ideal)
+      if (room.live_status?.fall_detected) {
+        emergency = true;
+        alertRoom = roomKey;
+      }
+      // Method 2: motion.val > 0 (actual ESP data structure)
+      if (room.motion?.val > 0) {
+        emergency = true;
+        alertRoom = roomKey;
+      }
     });
+
+    // Method 3: Global sensor_data.status (fallback from ESP)
+    if (sensorData?.status === 'Fall Down' || sensorData?.status === 'fall_detected') {
+      emergency = true;
+    }
 
     // Only update state if changed to prevent loops
     if (emergency !== activeAlert) {
       setActiveAlert(emergency);
       if (emergency) {
         setAlarmAcknowledged(false); // Reset ack on new alert
+        console.log('🚨 FALL ALERT triggered!', { alertRoom, sensorStatus: sensorData?.status });
 
         // --- IMMEDIATE SYSTEM ALERT (Background/Locked fallback) ---
         // 1. Vibrate device (SOS Pattern: ... --- ...)
@@ -388,16 +419,18 @@ export default function App() {
         if ("Notification" in window && Notification.permission === "granted") {
           try {
             new Notification("🚨 FALL DETECTED!", {
-              body: "Connect to Dashboard immediately! Patient requires assistance.",
-              icon: "/vite.png", // Use our new logo
-              requireInteraction: true, // Keep notification until clicked
-              tag: "fall-alert" // Prevent duplicate stacking
+              body: alertRoom
+                ? `Room ${alertRoom.replace('room_', '')} — Patient requires assistance!`
+                : "Connect to Dashboard immediately! Patient requires assistance.",
+              icon: "/vite.png",
+              requireInteraction: true,
+              tag: "fall-alert"
             });
           } catch (e) { console.error("Notification failed", e); }
         }
       }
     }
-  }, [wardData, activeAlert]);
+  }, [wardData, sensorData, activeAlert]);
 
   // Alarm Control Effect
   useEffect(() => {
@@ -599,8 +632,9 @@ export default function App() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {Object.entries(wardData).map(([key, room]) => {
-                const isEmergency = room.live_status?.fall_detected;
-                const isOffline = !room.live_status?.online; // Assume 'online' field exists or check timestamp (not implemented here for brevity)
+                // Fall detection: check live_status OR motion.val OR global sensor_data
+                const isEmergency = room.live_status?.fall_detected || (room.motion?.val > 0) || (sensorData?.status === 'Fall Down');
+                const isOffline = room.live_status?.online === false; // Only offline if explicitly set to false
 
                 return (
                   <div key={key} className={cn(
@@ -620,7 +654,7 @@ export default function App() {
                         </div>
                         <div>
                           <h3 className="text-lg font-bold text-slate-100">
-                            {room.patient_info?.name || "Unknown Patient"}
+                            {room.patient_info?.name || room.config?.patient_name || `Room ${key.replace('room_', '')}`}
                           </h3>
                           <p className={cn(
                             "text-xs font-bold uppercase tracking-wider flex items-center gap-1.5",
@@ -643,9 +677,9 @@ export default function App() {
                         </div>
                         <span className={cn(
                           "font-bold text-sm px-3 py-1 rounded-full",
-                          isEmergency ? "bg-red-500/20 text-red-500" : "bg-green-500/20 text-green-500"
+                          isEmergency ? "bg-red-500/20 text-red-500 animate-pulse" : "bg-green-500/20 text-green-500"
                         )}>
-                          {isEmergency ? "FALL DETECTED" : "Normal"}
+                          {isEmergency ? "🚨 FALL DETECTED" : "Normal"}
                         </span>
                       </div>
                     </div>
@@ -735,7 +769,7 @@ export default function App() {
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
                       {pairedRooms.map(([roomKey, group]) => {
                         const roomData = wardData[roomKey];
-                        const isFallDetected = roomData?.live_status?.fall_detected || false;
+                        const isFallDetected = roomData?.live_status?.fall_detected || (roomData?.motion?.val > 0) || (sensorData?.status === 'Fall Down') || false;
                         const patientName = roomData?.patient_info?.name || 'Unknown Patient';
                         const isComplete = group.cam.length > 0 && group.monitor.length > 0;
                         const allDevices = [...group.cam, ...group.monitor];
