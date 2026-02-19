@@ -202,7 +202,9 @@ class AlarmSound {
   }
 
   _playWebAudio() {
-    if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => { });
+    }
     const playOnce = () => {
       if (!this.isPlaying || !this.audioCtx) return;
       const s = this.audioCtx.createBufferSource();
@@ -248,7 +250,8 @@ export default function App() {
   const [error, setError] = useState(null);
 
   // Data State
-  const [wardData, setWardData] = useState({});
+  // Data State
+  const [wardsData, setWardsData] = useState({});
   const [devices, setDevices] = useState({});
   const [sensorData, setSensorData] = useState({}); // /sensor_data (global fall status from ESP)
   const [editingDevice, setEditingDevice] = useState(null);
@@ -265,11 +268,7 @@ export default function App() {
       // Update Device Config so board knows where it is
       updates[`hospital_system/devices/${deviceId}/config/room_id`] = normalizedRoom;
       updates[`hospital_system/devices/${deviceId}/config/patient_name`] = patientName;
-      updates[`hospital_system/devices/${deviceId}/config/assigned_room`] = normalizedRoom; // Legacy field consistent
-
-      // OPTIONAL: Update Ward Data directly so changes reflect immediately even if device is offline
-      // This makes the dashboard feel "instant"
-      updates[`hospital_system/wards/ward_A/${normalizedRoom}/patient_info/name`] = patientName;
+      updates[`hospital_system/devices/${deviceId}/config/assigned_room`] = normalizedRoom;
 
       await update(ref(db), updates);
       console.log(`Updated ${deviceId} -> ${normalizedRoom} : ${patientName}`);
@@ -285,6 +284,13 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [alarmAcknowledged, setAlarmAcknowledged] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
+
+  // Track unacked count to re-trigger alarm on new events
+  const lastUnackedCount = useRef(0);
+
+  // Modal State
+  const [viewingRoom, setViewingRoom] = useState(null); // { wardKey, roomKey, ...roomData }
+  const [resolvingRoom, setResolvingRoom] = useState(null); // { wardKey, roomKey }
 
   const alarmRef = useRef(null);
 
@@ -305,16 +311,15 @@ export default function App() {
   useEffect(() => {
     let unsubscribeWards = null;
     let unsubscribeDevices = null;
-    let unsubscribeSensor = null;
 
     const setupListeners = () => {
-      // 1. Listen to Ward Data
-      const wardsRef = ref(db, 'hospital_system/wards/ward_A');
+      // 1. One Listener to Rule Them All (Wards -> Rooms -> Devices)
+      const wardsRef = ref(db, 'hospital_system/wards');
       unsubscribeWards = onValue(wardsRef, (snapshot) => {
         const data = snapshot.val() || {};
-        setWardData(data);
+        setWardsData(data); // Store all wards
         setConnected(true);
-        setError(null); // Clear setup/connection errors on success
+        setError(null);
         setLoading(false);
       }, (err) => {
         console.error("Ward Listen Error:", err);
@@ -322,17 +327,12 @@ export default function App() {
         setConnected(false);
       });
 
-      // 2. Listen to Devices
+      // 2. Listen for Unassigned Devices (Global Discovery for Auto-Detect)
       const devicesRef = ref(db, 'hospital_system/devices');
       unsubscribeDevices = onValue(devicesRef, (snapshot) => {
-        setDevices(snapshot.val() || {});
-      }, (err) => console.error("Device Listen Error:", err));
-
-      // 3. Listen to sensor_data (global ESP fall status)
-      const sensorRef = ref(db, 'sensor_data');
-      unsubscribeSensor = onValue(sensorRef, (snapshot) => {
-        setSensorData(snapshot.val() || {});
-      }, (err) => console.error("Sensor Listen Error:", err));
+        const data = snapshot.val() || {};
+        setDevices(data);
+      });
     };
 
     // Authenticate (Anonymous)
@@ -373,173 +373,172 @@ export default function App() {
     return () => {
       if (unsubscribeWards) unsubscribeWards();
       if (unsubscribeDevices) unsubscribeDevices();
-      if (unsubscribeSensor) unsubscribeSensor();
     };
   }, []); // Run once on mount
 
-  // Alert Logic based on Data
-  useEffect(() => {
-    let hasFall = false;
-    let hasUnackedFall = false;
-    let alertRoom = null;
+  // --- Logic Helper: Get Room Status (Generic for Future Devices) ---
+  const getRoomLogic = (room) => {
+    const devices = room.devices || {};
+    const devValues = Object.values(devices);
 
-    // Check ward rooms
-    Object.entries(wardData).forEach(([roomKey, room]) => {
-      // Check ALL possible fall data paths:
-      // 1. live_status.fall_detected (Original plan)
-      // 2. motion.val > 0 (ESP32-S3-CAM existing logic)
-      // 3. fall_detection.status === 'Fall Down' (New requirement per user)
-      const isFall = room.live_status?.fall_detected ||
-        (room.motion?.val > 0) ||
-        (room.fall_detection?.status === 'Fall Down');
-      const isAck = room.live_status?.acknowledged === true;
+    let isFall = false;
+    let isOffline = true;
+    let hasDevices = devValues.length > 0;
 
-      if (isFall) {
-        hasFall = true;
-        if (!isAck) {
-          hasUnackedFall = true;
-          alertRoom = roomKey;
-        }
+    // Robust Legacy Fall Check (Handle String/Boolean)
+    let legacyFall = room.live_status?.fall_detected;
+    if (String(legacyFall).toLowerCase() === 'true') legacyFall = true;
+    else if (String(legacyFall).toLowerCase() === 'false') legacyFall = false;
+    else legacyFall = !!legacyFall;
+
+    // Robust Ack Check (Handle String/Boolean)
+    let isAck = room.live_status?.acknowledged;
+    if (String(isAck).toLowerCase() === 'true') isAck = true;
+    else isAck = false;
+
+    if (hasDevices) {
+      // Generic Online Check: If Any CAM/Monitor is Online
+      // Filter for significant devices (usually have IP or specific roles)
+      const significantDevices = devValues.filter(d => d.ip || d.Role === 'Monitor' || d.model?.includes('CAM'));
+
+      const significantOnline = significantDevices.filter(d => {
+        const s = (d.Status || d.status || '').toLowerCase();
+        return s === 'online' || s === 'normal';
+      });
+
+      if (significantDevices.length > 0) {
+        if (significantOnline.length > 0) isOffline = false;
+      } else {
+        isOffline = false; // Sensors usually don't have "Offline" status
       }
+
+      // Fall Detection (Generic - Case Insensitive)
+      const deviceFall = devValues.some(d => {
+        const s = (d.Status || d.status || '').toLowerCase();
+        const detect = (d.Detection || '').toLowerCase();
+
+        if (s === 'fall down' || s === 'emergency' || s === 'fall') return true;
+        if (s.includes('fall detected')) return true;
+        if (detect === 'yes') return true;
+        return false;
+      });
+      isFall = deviceFall || legacyFall;
+    } else {
+      isFall = legacyFall;
+    }
+
+    return {
+      isFall,
+      isOffline,
+      isAck,
+      hasDevices
+    };
+  };
+
+  // Global Alert Logic (Multi-Ward)
+  useEffect(() => {
+    let unackedCount = 0;
+    let anyFall = false;
+    let alertRoomName = "";
+
+    Object.entries(wardsData).forEach(([wardName, ward]) => {
+      Object.entries(ward).forEach(([roomKey, room]) => {
+        const { isFall, isAck } = getRoomLogic(room);
+        if (isFall) {
+          anyFall = true;
+          console.log(`[DEBUG] Fall Detected in ${wardName}/${roomKey} | Ack: ${isAck}`, room); // DEBUG
+          if (!isAck) {
+            unackedCount++;
+            alertRoomName = `${wardName.replace('ward_', '')} - ${roomKey.replace('room_', '')}`;
+          }
+        }
+      });
     });
 
-    // Check global sensor (fallback)
-    if (sensorData?.status === 'Fall Down' || sensorData?.status === 'fall_detected') {
-      hasFall = true;
-      // Global sensor doesn't have per-room ack easily, so we assume unacked unless handled globally
-      // But typically this is tied to a single room in simple setups.
-      hasUnackedFall = true;
-    }
-
-    // Update active alert state (Visual Red/Orange Banner)
-    if (hasFall !== activeAlert) {
-      setActiveAlert(hasFall);
-    }
-
-    // Trigger Notifications/Vibration ONLY if there's a NEW unacked fall
-    // We use a ref or check if we were previously cleared to avoid loop
-    if (hasUnackedFall && !alarmAcknowledged) {
-      // If we have an unacked fall, ensure sound plays (reset silence if needed)
+    // Re-Trigger Alarm if new unacked event appears
+    if (unackedCount > lastUnackedCount.current) {
       setAlarmAcknowledged(false);
+    }
+    lastUnackedCount.current = unackedCount;
 
-      // --- IMMEDIATE SYSTEM ALERT ---
-      if (navigator.vibrate) {
-        navigator.vibrate([100, 50, 100, 50, 100, 200, 300, 100, 300, 100, 300, 200, 100, 50, 100, 50, 100]);
-      }
+    setActiveAlert(anyFall);
 
+    if (unackedCount > 0 && !alarmAcknowledged) {
+      // Only trigger notification if unacked
       if ("Notification" in window && Notification.permission === "granted") {
         try {
-          new Notification("🚨 FALL DETECTED!", {
-            body: alertRoom
-              ? `Room ${alertRoom.replace('room_', '')} — Patient requires assistance!`
-              : "Connect to Dashboard immediately! Patient requires assistance.",
-            icon: "/vite.png",
-            requireInteraction: true,
-            tag: "fall-alert"
-          });
-        } catch (e) { console.error("Notification failed", e); }
+          new Notification("FALL DETECTED!", { body: alertRoomName });
+        } catch (e) { }
       }
     }
-  }, [wardData, sensorData, activeAlert]);
+  }, [wardsData, activeAlert, alarmAcknowledged]);
 
-  // Alarm Control Effect
+  // Handle Audio Alarm
   useEffect(() => {
-    // Play sound if there is an Active Alert AND it hasn't been locally silenced AND there are unacked falls
-    // Actually, simpler: Play sound if there are ANY unacked falls.
-    // But we keep local silence 'alarmAcknowledged' as a "mute for this session" option too.
-
     let anyUnacked = false;
-    Object.values(wardData).forEach(room => {
-      const isFall = room.live_status?.fall_detected || (room.motion?.val > 0);
-      const isAck = room.live_status?.acknowledged === true;
-      if (isFall && !isAck) anyUnacked = true;
+    Object.values(wardsData).forEach(ward => {
+      Object.values(ward).forEach(room => {
+        const { isFall, isAck } = getRoomLogic(room);
+        if (isFall && !isAck) anyUnacked = true;
+      });
     });
-    if (sensorData?.status === 'Fall Down') anyUnacked = true;
+
+    // Debug Alarm Logic
+    console.log("Alarm Check:", { activeAlert, anyUnacked, isMuted, alarmAcknowledged, audioReady });
 
     if (activeAlert && anyUnacked && !isMuted && !alarmAcknowledged) {
+      console.log("Attempting to PLAY alarm...");
       alarmRef.current?.play();
     } else {
+      console.log("Stopping alarm...");
       alarmRef.current?.stop();
     }
-  }, [wardData, sensorData, activeAlert, isMuted, alarmAcknowledged]);
+  }, [wardsData, activeAlert, isMuted, alarmAcknowledged, audioReady]);
 
-
-
-
-  // Actions
-  const handleAcknowledge = async (roomKey) => {
+  const handleAcknowledge = async (wardKey, roomKey) => {
     try {
-      const roomRef = ref(db, `hospital_system/wards/ward_A/${roomKey}/live_status`);
+      const roomRef = ref(db, `hospital_system/wards/${wardKey}/${roomKey}/live_status`);
       await update(roomRef, { acknowledged: true });
-      setAlarmAcknowledged(true); // Stop sound locally immediately
-    } catch (err) {
-      console.error("Ack Error:", err);
-    }
+      setAlarmAcknowledged(true);
+    } catch (err) { console.error(err); }
   };
 
   const handleAcknowledgeAll = async () => {
-    Object.entries(wardData).forEach(async ([key, room]) => {
-      // Logic must match Alert Logic above
-      const isFall = room.live_status?.fall_detected ||
-        (room.motion?.val > 0) ||
-        (room.fall_detection?.status === 'Fall Down');
-      const isAck = room.live_status?.acknowledged === true;
-      if (isFall && !isAck) {
-        await handleAcknowledge(key);
-      }
+    const updates = {};
+    Object.entries(wardsData).forEach(([wardKey, ward]) => {
+      Object.entries(ward).forEach(([roomKey, room]) => {
+        const { isFall, isAck } = getRoomLogic(room);
+        if (isFall && !isAck) {
+          updates[`hospital_system/wards/${wardKey}/${roomKey}/live_status/acknowledged`] = true;
+        }
+      });
     });
-    // Also silence global
-    setAlarmAcknowledged(true);
+
+    if (Object.keys(updates).length > 0) {
+      await update(ref(db), updates);
+      setAlarmAcknowledged(true);
+    }
   };
 
-  const handleResolve = async (roomKey) => {
-    if (!window.confirm("Confirm patient assistance is complete? This will reset the alarm.")) return;
+  const confirmResolution = async () => {
+    if (!resolvingRoom) return;
+    const { wardKey, roomKey } = resolvingRoom;
+
     try {
-      // 1. Reset Room Status
-      const roomRef = ref(db, `hospital_system/wards/ward_A/${roomKey}`);
+      const roomRef = ref(db, `hospital_system/wards/${wardKey}/${roomKey}`);
       await update(roomRef, {
         "live_status/fall_detected": false,
         "live_status/acknowledged": false,
-        "motion/val": 0
+        "devices/Pir_Motion_Sensor/val": 0,
+        "devices/Pir_Motion_Sensor/object_present": "No",
+        "devices/ESP32_S3_CAM/Status": "Normal",
+        "devices/ESP32_S3_CAM/Detection": "No"
       });
-
-      // 2. Reset Global Sensor (if applicable)
-      if (sensorData?.status === 'Fall Down') {
-        const sensorRef = ref(db, 'sensor_data');
-        await update(sensorRef, { status: 'Normal' });
-      }
-      setAlarmAcknowledged(false);
+      setResolvingRoom(null);
     } catch (err) {
-      console.error("Resolve Error:", err);
+      console.error("Resolution Error:", err);
+      alert("Failed to resolve: " + err.message);
     }
-  };
-
-  const handleAssignRoom = async (deviceId, roomKey) => {
-    try {
-      const deviceRef = ref(db, `hospital_system/devices/${deviceId}/config`);
-      await update(deviceRef, { assigned_room: roomKey });
-      console.log(`Assigned ${deviceId} to ${roomKey}`);
-    } catch (err) {
-      console.error("Assign Error:", err);
-      alert("Failed to assign room: " + err.message);
-    }
-  };
-
-  const handleUnlink = async (deviceId) => {
-    if (!window.confirm("Unlink this device from its room?")) return;
-    try {
-      const deviceRef = ref(db, `hospital_system/devices/${deviceId}/config`);
-      await update(deviceRef, { assigned_room: 'none' });
-    } catch (err) {
-      console.error("Unlink Error:", err);
-    }
-  };
-
-  const getRoomOptions = () => {
-    return Object.keys(wardData).map(key => ({
-      value: key,
-      label: `Room ${key.replace('room_', '')}`
-    }));
   };
 
   // Global Auto-Unlock (Any interaction enabling audio)
@@ -680,11 +679,13 @@ export default function App() {
           <div className="space-y-6">
             {activeAlert && (
               (() => {
-                const unackedRooms = Object.entries(wardData).filter(([k, r]) =>
-                  ((r.live_status?.fall_detected || r.motion?.val > 0) && !r.live_status?.acknowledged) ||
-                  (sensorData?.status === 'Fall Down' && !r.live_status?.acknowledged) // approximate global check
+                let hasUnacked = false;
+                Object.values(wardsData).forEach(ward =>
+                  Object.values(ward).forEach(room => {
+                    const { isFall, isAck } = getRoomLogic(room);
+                    if (isFall && !isAck) hasUnacked = true;
+                  })
                 );
-                const hasUnacked = unackedRooms.length > 0;
 
                 return (
                   <div className={cn(
@@ -703,12 +704,22 @@ export default function App() {
                       </div>
                     </div>
                     {hasUnacked ? (
-                      <button
-                        onClick={handleAcknowledgeAll}
-                        className="px-6 py-3 bg-white text-red-600 font-bold rounded-xl shadow-lg hover:bg-gray-100 transition transform hover:scale-105 flex items-center gap-2"
-                      >
-                        <CheckCircle size={20} /> ACKNOWLEDGE ALL
-                      </button>
+                      <div className="flex gap-2">
+                        {!audioReady && (
+                          <button
+                            onClick={() => alarmRef.current?._unlock()}
+                            className="px-4 py-3 bg-amber-400 text-black font-bold rounded-xl shadow-lg hover:bg-amber-300 animate-pulse flex items-center gap-2"
+                          >
+                            <Volume2 size={20} /> ENABLE SOUND
+                          </button>
+                        )}
+                        <button
+                          onClick={handleAcknowledgeAll}
+                          className="px-6 py-3 bg-white text-red-600 font-bold rounded-xl shadow-lg hover:bg-gray-100 transition transform hover:scale-105 flex items-center gap-2"
+                        >
+                          <CheckCircle size={20} /> ACKNOWLEDGE ALL
+                        </button>
+                      </div>
                     ) : (
                       <div className="flex items-center gap-2 bg-black/20 px-4 py-2 rounded-lg border border-white/20">
                         <Activity size={18} className="animate-spin" />
@@ -720,109 +731,114 @@ export default function App() {
               })()
             )}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {Object.entries(wardData).map(([key, room]) => {
-                // Status Logic
-                const isFall = room.live_status?.fall_detected ||
-                  (room.motion?.val > 0) ||
-                  (sensorData?.status === 'Fall Down') ||
-                  (room.fall_detection?.status === 'Fall Down');
+            {/* Iterate Wards */}
+            {Object.entries(wardsData).map(([wardKey, wardRooms]) => (
+              <div key={wardKey} className="space-y-4 pt-4">
+                <h2 className="text-xl font-bold text-slate-400 border-b border-slate-800 pb-2 mb-6 flex items-center gap-2">
+                  <LayoutDashboard size={20} />
+                  {wardKey.replace('ward_', 'Ward ').toUpperCase()}
+                  <span className="text-xs bg-slate-800 px-2 py-1 rounded-full text-slate-500">{Object.keys(wardRooms).length} Rooms</span>
+                </h2>
 
-                const isAck = room.live_status?.acknowledged === true;
-                const isEmergency = isFall && !isAck;
-                const isWaiting = isFall && isAck;
-                const isOffline = room.live_status?.online === false;
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {Object.entries(wardRooms).map(([roomKey, room]) => {
+                    const { isFall, isAck, isOffline } = getRoomLogic(room);
+                    const isEmergency = isFall && !isAck;
+                    const isWaiting = isFall && isAck;
 
-                return (
-                  <div key={key} className={cn(
-                    "relative overflow-hidden rounded-3xl border transition-all duration-300 group",
-                    isEmergency
-                      ? "bg-red-900/40 border-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] scale-[1.02]"
-                      : isWaiting
-                        ? "bg-amber-900/40 border-amber-500 shadow-[0_0_20px_rgba(245,158,11,0.2)]"
-                        : "bg-slate-900/40 border-slate-800 hover:border-slate-700 hover:-translate-y-1 hover:shadow-xl backdrop-blur-sm"
-                  )}>
-                    {/* Card Header */}
-                    <div className="p-6 border-b border-white/5 flex justify-between items-start">
-                      <div className="flex items-center gap-4">
-                        <div className={cn(
-                          "w-14 h-14 rounded-2xl flex items-center justify-center text-white font-bold text-xl shadow-lg transition-transform group-hover:scale-110",
-                          isEmergency ? "bg-red-600 animate-bounce" : isWaiting ? "bg-amber-500 animate-pulse" : "bg-slate-800"
-                        )}>
-                          {key.replace('room_', '')}
+                    return (
+                      <div key={roomKey} className={cn(
+                        "relative overflow-hidden rounded-3xl border transition-all duration-300 group",
+                        isEmergency
+                          ? "bg-red-900/40 border-red-500 shadow-[0_0_30px_rgba(220,38,38,0.3)] scale-[1.02]"
+                          : isWaiting
+                            ? "bg-amber-900/40 border-amber-500 shadow-[0_0_20px_rgba(245,158,11,0.2)]"
+                            : "bg-slate-900/40 border-slate-800 hover:border-slate-700 hover:-translate-y-1 hover:shadow-xl backdrop-blur-sm"
+                      )}>
+                        {/* Card Header */}
+                        <div className="p-6 border-b border-white/5 flex justify-between items-start">
+                          <div className="flex items-center gap-4">
+                            <div className={cn(
+                              "w-14 h-14 rounded-2xl flex items-center justify-center text-white font-bold text-xl shadow-lg transition-transform group-hover:scale-110",
+                              isEmergency ? "bg-red-600 animate-bounce" : isWaiting ? "bg-amber-500 animate-pulse" : "bg-slate-800"
+                            )}>
+                              {roomKey.replace('room_', '')}
+                            </div>
+
+                            <div>
+                              <h3 className="text-lg font-bold text-slate-100">
+                                {room.patient_info?.name || room.config?.patient_name || `Room ${roomKey.replace('room_', '')}`}
+                              </h3>
+                              <div className="flex flex-col">
+                                <p className={cn(
+                                  "text-xs font-bold uppercase tracking-wider flex items-center gap-1.5",
+                                  isOffline ? "text-slate-500" : "text-green-500"
+                                )}>
+                                  <span className={cn("w-1.5 h-1.5 rounded-full", isOffline ? "bg-slate-600" : "bg-green-500")} />
+                                  {isOffline ? "OFFLINE" : "ACTIVE MONITORING"}
+                                </p>
+                                {/* Show Last Update if available from new path */}
+                                {room.fall_detection?.last_update && (
+                                  <p className="text-[10px] text-slate-500 mt-0.5">
+                                    Updated: {room.fall_detection.last_update}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          {isEmergency && <ShieldAlert className="text-red-500 animate-pulse" size={28} />}
+                          {isWaiting && <Stethoscope className="text-amber-500 animate-pulse" size={28} />}
                         </div>
 
-                        <div>
-                          <h3 className="text-lg font-bold text-slate-100">
-                            {room.patient_info?.name || room.config?.patient_name || `Room ${key.replace('room_', '')}`}
-                          </h3>
-                          <div className="flex flex-col">
-                            <p className={cn(
-                              "text-xs font-bold uppercase tracking-wider flex items-center gap-1.5",
-                              isOffline ? "text-slate-500" : "text-green-500"
+                        {/* Card Body & Actions */}
+                        <div className="p-6 space-y-4">
+                          <div className="flex justify-between items-center text-sm text-slate-400">
+                            <span>Status</span>
+                            <span className={cn(
+                              "font-bold text-sm px-3 py-1 rounded-full flex items-center gap-2",
+                              isEmergency
+                                ? "bg-red-500/20 text-red-500 animate-pulse"
+                                : isWaiting
+                                  ? "bg-amber-500/20 text-amber-500"
+                                  : "bg-green-500/20 text-green-500"
                             )}>
-                              <span className={cn("w-1.5 h-1.5 rounded-full", isOffline ? "bg-slate-600" : "bg-green-500")} />
-                              {isOffline ? "OFFLINE" : "ACTIVE MONITORING"}
-                            </p>
-                            {/* Show Last Update if available from new path */}
-                            {room.fall_detection?.last_update && (
-                              <p className="text-[10px] text-slate-500 mt-0.5">
-                                Updated: {room.fall_detection.last_update}
-                              </p>
+                              {isEmergency && <AlertTriangle size={14} />}
+                              {isWaiting && <Stethoscope size={14} />}
+                              {isEmergency ? "🚨 FALL DETECTED" : isWaiting ? "WAITING FOR HELP" : "Normal"}
+                            </span>
+                          </div>
+
+                          <div className="pt-2">
+                            {isEmergency ? (
+                              <button
+                                onClick={() => handleAcknowledge(wardKey, roomKey)}
+                                className="w-full py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl shadow-lg shadow-red-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
+                              >
+                                <CheckCircle size={18} /> Acknowledge Alarm
+                              </button>
+                            ) : isWaiting ? (
+                              <button
+                                onClick={() => setResolvingRoom({ wardKey, roomKey })}
+                                className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl shadow-lg shadow-amber-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
+                              >
+                                <XCircle size={18} /> Confirm Assistance Complete
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => setViewingRoom({ wardKey, roomKey, ...room })}
+                                className="w-full py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-xl flex items-center justify-center gap-2 transition-all border border-slate-700 hover:border-slate-600"
+                              >
+                                Details
+                              </button>
                             )}
                           </div>
                         </div>
                       </div>
-                      {isEmergency && <ShieldAlert className="text-red-500 animate-pulse" size={28} />}
-                      {isWaiting && <Stethoscope className="text-amber-500 animate-pulse" size={28} />}
-                    </div>
-
-                    {/* Card Body */}
-                    <div className="p-6 space-y-4">
-                      <div className="flex justify-between items-center text-sm text-slate-400">
-                        <span>Status</span>
-                        <span className={cn(
-                          "font-bold text-sm px-3 py-1 rounded-full flex items-center gap-2",
-                          isEmergency
-                            ? "bg-red-500/20 text-red-500 animate-pulse"
-                            : isWaiting
-                              ? "bg-amber-500/20 text-amber-500"
-                              : "bg-green-500/20 text-green-500"
-                        )}>
-                          {isEmergency && <AlertTriangle size={14} />}
-                          {isWaiting && <Stethoscope size={14} />}
-                          {isEmergency ? "🚨 FALL DETECTED" : isWaiting ? "WAITING FOR HELP" : "Normal"}
-                        </span>
-                      </div>
-
-                      {/* Action Buttons */}
-                      <div className="pt-2">
-                        {isEmergency ? (
-                          <button
-                            onClick={() => handleAcknowledge(key)}
-                            className="w-full py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl shadow-lg shadow-red-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
-                          >
-                            <CheckCircle size={18} /> Acknowledge Alarm
-                          </button>
-                        ) : isWaiting ? (
-                          <button
-                            onClick={() => handleResolve(key)}
-                            className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-slate-900 font-bold rounded-xl shadow-lg shadow-amber-900/50 flex items-center justify-center gap-2 transition-all active:scale-95 hover:scale-[1.02]"
-                          >
-                            <XCircle size={18} /> Confirm Assistance Complete
-                          </button>
-                        ) : (
-                          <button className="w-full py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-xl flex items-center justify-center gap-2 transition-all border border-slate-700 hover:border-slate-600">
-                            Details
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                );
-              })}
-            </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
           </div>
         )
         }
@@ -830,412 +846,360 @@ export default function App() {
         {/* --- Devices Tab: Pairing & Management --- */}
         {
           activeTab === 'devices' && (() => {
-            // === Group devices by assigned room ===
-            const roomPairings = {}; // { room_301: { cam: [...], monitor: [...] } }
-            const pendingDevices = []; // devices not yet assigned
-
-            Object.entries(devices).forEach(([deviceId, device]) => {
-              const room = device.config?.assigned_room;
-              const isPaired = room && room !== 'none';
-              const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
-
-              if (isPaired) {
-                if (!roomPairings[room]) roomPairings[room] = { cam: [], monitor: [] };
-                if (isCAM) {
-                  roomPairings[room].cam.push({ id: deviceId, ...device });
-                } else {
-                  roomPairings[room].monitor.push({ id: deviceId, ...device });
-                }
-              } else {
-                pendingDevices.push({ id: deviceId, ...device });
-              }
+            // Flatten devices for statistics (Ward Aware)
+            const allDevices = [];
+            Object.entries(wardsData).forEach(([wardKey, rooms]) => {
+              Object.entries(rooms).forEach(([roomKey, room]) => {
+                const devs = room.devices || {};
+                Object.entries(devs).forEach(([devName, devData]) => {
+                  if (devName === 'Pir_Motion_Sensor') return;
+                  allDevices.push({ ward: wardKey, room: roomKey, name: devName, ...devData });
+                });
+              });
             });
 
-            const pairedRooms = Object.entries(roomPairings);
+            // Filter Unassigned Devices for Auto-Discovery Section
+            const unassignedList = Object.entries(devices).filter(([key, dev]) => {
+              if (key === 'Pir_Motion_Sensor') return false;
+              return !dev.config?.assigned_room || dev.config.assigned_room === 'unassigned';
+            });
 
             return (
               <div className="space-y-6 animate-in fade-in zoom-in duration-300">
-                {/* Header */}
+                {/* Header Stats */}
                 <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
                   <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
                     <div>
                       <h2 className="text-xl font-bold text-white flex items-center gap-2">
                         <Cpu className="text-blue-400" />
-                        🔌 Device Pairing & Management
+                        🔌 System Hardware Status
                       </h2>
                       <p className="text-slate-400 text-sm mt-1">
-                        Plug & Play — ESP32_S3_CAM + Nurse_Monitor auto-pair per room
+                        Real-time status of all devices across all wards.
                       </p>
                     </div>
                     <div className="flex gap-2 flex-wrap">
-                      <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-full text-xs font-bold border border-emerald-500/20 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                        {pairedRooms.filter(([, g]) => g.cam.length > 0 && g.monitor.length > 0).length} Complete
-                      </span>
-                      <span className="bg-cyan-500/10 text-cyan-400 px-3 py-1.5 rounded-full text-xs font-bold border border-cyan-500/20 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-cyan-500" />
-                        {pairedRooms.filter(([, g]) => g.cam.length === 0 || g.monitor.length === 0).length} Partial
-                      </span>
-                      <span className="bg-amber-500/10 text-amber-400 px-3 py-1.5 rounded-full text-xs font-bold border border-amber-500/20 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-amber-500" />
-                        {pendingDevices.length} Pending
-                      </span>
                       <span className="bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-full text-xs font-bold border border-blue-500/20">
-                        {Object.keys(devices).length} Total
+                        {Object.keys(wardsData).length} Wards Active
+                      </span>
+                      <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-full text-xs font-bold border border-emerald-500/20">
+                        {allDevices.length} Devices Total
                       </span>
                     </div>
                   </div>
+                </div>
 
-                  {/* ====== PAIRED ROOM CARDS ====== */}
-                  {pairedRooms.length > 0 && (
-                    <div className="mb-2">
-                      <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                        <Link2 size={14} /> Paired Rooms ({pairedRooms.length})
-                      </h3>
-                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-                        {pairedRooms.map(([roomKey, group]) => {
-                          const roomData = wardData[roomKey];
-                          const isFall = roomData?.live_status?.fall_detected ||
-                            (roomData?.motion?.val > 0) ||
-                            (sensorData?.status === 'Fall Down') ||
-                            (roomData?.fall_detection?.status === 'Fall Down') ||
-                            false;
+                {/* Unassigned Devices (Auto-Discovery) */}
+                {unassignedList.length > 0 && (
+                  <div className="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-6 mb-6">
+                    <h3 className="text-amber-400 font-bold flex items-center gap-2 mb-4">
+                      <AlertTriangle size={20} /> New Devices Detected ({unassignedList.length})
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {unassignedList.map(([id, dev]) => (
+                        <div key={id} className="bg-slate-900/80 p-4 rounded-xl border border-slate-700/50 flex flex-col justify-between gap-3">
+                          <div>
+                            <div className="flex justify-between items-start">
+                              <h4 className="font-mono font-bold text-slate-200 truncate" title={id}>{id}</h4>
+                              <span className="text-[10px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded uppercase tracking-wider">New</span>
+                            </div>
+                            <p className="text-xs text-slate-500 mt-1">{dev.type || 'Unknown Type'}</p>
+                          </div>
 
-                          const isAck = roomData?.live_status?.acknowledged === true && isFall;
-                          const isFallDetected = isFall && !isAck; // Only show RED if not acked
-                          const patientName = roomData?.patient_info?.name || 'Unknown Patient';
-                          const isComplete = group.cam.length > 0 && group.monitor.length > 0;
-                          const allDevices = [...group.cam, ...group.monitor];
-
-                          return (
-                            <div
-                              key={roomKey}
-                              className={cn(
-                                "rounded-2xl border-2 overflow-hidden transition-all duration-500",
-                                isFallDetected
-                                  ? "border-red-500/60 bg-red-950/20 shadow-[0_0_25px_rgba(220,38,38,0.2)]"
-                                  : isComplete
-                                    ? "border-emerald-500/30 bg-slate-800/40 hover:border-emerald-400/50"
-                                    : "border-cyan-500/30 bg-slate-800/40 hover:border-cyan-400/50"
-                              )}
+                          <div className="flex gap-2">
+                            <input
+                              id={`assign-room-${id}`}
+                              placeholder="Room (e.g. 301)"
+                              className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:border-amber-500 outline-none"
+                            />
+                            <button
+                              onClick={() => handleSaveConfig(id, document.getElementById(`assign-room-${id}`).value, '')}
+                              className="bg-amber-600 hover:bg-amber-500 text-white px-3 py-2 rounded-lg text-xs font-bold transition-colors"
                             >
-                              {/* Room Header */}
-                              <div className={cn(
-                                "px-5 py-3 flex items-center justify-between border-b",
-                                isFallDetected ? "bg-red-900/30 border-red-800/50" : "bg-slate-900/60 border-slate-700/50"
-                              )}>
-                                <div className="flex items-center gap-3">
-                                  <div className={cn(
-                                    "w-10 h-10 rounded-xl flex items-center justify-center text-base font-bold",
-                                    isFallDetected ? "bg-red-600 text-white animate-pulse" : "bg-slate-700 text-white"
-                                  )}>
-                                    {roomKey.replace('room_', '')}
-                                  </div>
-                                  <div>
-                                    <h4 className="text-sm font-bold text-white">{patientName}</h4>
-                                    <p className={cn(
-                                      "text-[11px] flex items-center gap-1",
-                                      isFallDetected ? "text-red-400 font-bold" : "text-emerald-400"
-                                    )}>
-                                      <span className={cn("w-1.5 h-1.5 rounded-full", isFallDetected ? "bg-red-500 animate-pulse" : "bg-emerald-500")} />
-                                      {isFallDetected ? '⚠ FALL DETECTED' : 'Monitoring Active'}
-                                    </p>
-                                  </div>
-                                </div>
-                                <span className={cn(
-                                  "px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider",
-                                  isComplete
-                                    ? "bg-emerald-900/60 text-emerald-300 border border-emerald-500/30"
-                                    : "bg-cyan-900/60 text-cyan-300 border border-cyan-500/30"
-                                )}>
-                                  {isComplete ? '✓ COMPLETE' : '◐ PARTIAL'}
+                              Assign
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Device List by Ward/Room */}
+                {Object.entries(wardsData).map(([wardKey, rooms]) => (
+                  <div key={wardKey} className="space-y-4">
+                    <h3 className="text-lg font-bold text-slate-500 uppercase tracking-widest pl-2 border-l-4 border-slate-700">
+                      {wardKey.replace('ward_', 'Ward ')}
+                    </h3>
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+                      {Object.entries(rooms).map(([roomKey, room]) => {
+                        const devList = Object.entries(room.devices || {}).filter(([n]) => n !== 'Pir_Motion_Sensor');
+                        const hasDevices = devList.length > 0;
+
+                        return (
+                          <div key={roomKey} className="bg-slate-900/40 rounded-2xl border border-slate-700/50 overflow-hidden">
+                            <div className="px-5 py-3 bg-slate-800/60 border-b border-slate-700/50 flex justify-between items-center">
+                              <h3 className="font-bold text-slate-200 flex items-center gap-2">
+                                <span className="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center text-xs">
+                                  {roomKey.replace('room_', '')}
                                 </span>
-                              </div>
+                                Device Bundle
+                              </h3>
+                              <span className={cn("text-xs font-mono px-2 py-1 rounded bg-black/20 text-slate-400", hasDevices ? "opacity-100" : "opacity-50")}>
+                                {devList.length} Units
+                              </span>
+                            </div>
 
-                              {/* Devices Row */}
-                              <div className="p-4">
-                                <div className="flex flex-col sm:flex-row items-stretch gap-3">
-                                  {/* Camera Device(s) */}
-                                  <div className={cn(
-                                    "flex-1 p-3.5 rounded-xl border transition-all",
-                                    group.cam.length > 0
-                                      ? "bg-slate-900/50 border-blue-500/20"
-                                      : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
-                                  )}>
-                                    <div className="flex items-center gap-2 mb-2">
-                                      <Camera size={14} className="text-blue-400" />
-                                      <span className="text-[11px] font-bold text-blue-400 uppercase tracking-wider">Camera</span>
-                                      {group.cam.length > 0 && (
-                                        <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
-                                      )}
-                                    </div>
-                                    {group.cam.length > 0 ? group.cam.map(d => {
-                                      const camOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
-                                      return (
-                                        <div key={d.id} className="space-y-1">
-                                          <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
-                                          <p className="text-[11px] text-slate-500">{d.info?.model || 'ESP32-S3-CAM'}</p>
-                                          <div className="flex justify-between text-[11px] text-slate-400">
-                                            <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
-                                            <span className={camOnline ? 'text-emerald-400' : 'text-slate-500'}>{camOnline ? '● On' : '○ Off'}</span>
-                                          </div>
-                                          {d.info?.ip && (
-                                            <a href={`http://${d.info.ip}/capture`} target="_blank" rel="noopener noreferrer"
-                                              className="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-1 mt-1">
-                                              <Camera size={9} /> Stream <ExternalLink size={8} />
-                                            </a>
-                                          )}
-                                        </div>
-                                      );
-                                    }) : (
-                                      <p className="text-[11px] text-slate-600 italic">No camera assigned</p>
-                                    )}
-                                  </div>
+                            <div className="p-4 space-y-3">
+                              {hasDevices ? (
+                                devList.map(([devName, devData]) => {
+                                  // Dynamic Icon Logic
+                                  let Icon = Cpu;
+                                  let colorClass = "text-slate-400";
+                                  const nameUpper = devName.toUpperCase();
+                                  if (nameUpper.includes('CAM')) { Icon = Camera; colorClass = "text-blue-400"; }
+                                  else if (nameUpper.includes('MONITOR')) { Icon = Monitor; colorClass = "text-emerald-400"; }
+                                  else if (nameUpper.includes('MOTION') || nameUpper.includes('RADAR')) { Icon = Activity; colorClass = "text-amber-400"; }
 
-                                  {/* Pairing Connector */}
-                                  <div className="flex sm:flex-col items-center justify-center gap-1 py-1 sm:py-0 sm:px-1">
-                                    <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
-                                    <div className={cn(
-                                      "w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all",
-                                      isComplete
-                                        ? isFallDetected
-                                          ? "bg-red-600 border-red-500 text-white animate-pulse shadow-[0_0_12px_rgba(220,38,38,0.5)]"
-                                          : "bg-emerald-600/80 border-emerald-500/50 text-white shadow-[0_0_8px_rgba(16,185,129,0.3)]"
-                                        : "bg-slate-700 border-slate-600 text-slate-400"
-                                    )}>
-                                      {isFallDetected ? <ShieldAlert size={14} /> : isComplete ? <Link2 size={14} /> : '?'}
-                                    </div>
-                                    <div className="hidden sm:block w-px h-4 bg-gradient-to-b from-transparent via-slate-600 to-transparent" />
-                                  </div>
+                                  // Status
+                                  const status = devData.Status || devData.status || "Unknown";
+                                  const isOnline = status === 'Online' || status === 'Normal';
 
-                                  {/* Monitor Device(s) */}
-                                  <div className={cn(
-                                    "flex-1 p-3.5 rounded-xl border transition-all",
-                                    group.monitor.length > 0
-                                      ? "bg-slate-900/50 border-violet-500/20"
-                                      : "bg-slate-900/20 border-dashed border-slate-700 opacity-50"
-                                  )}>
-                                    <div className="flex items-center gap-2 mb-2">
-                                      <Monitor size={14} className="text-violet-400" />
-                                      <span className="text-[11px] font-bold text-violet-400 uppercase tracking-wider">Nurse Monitor</span>
-                                      {group.monitor.length > 0 && (
-                                        <span className="ml-auto w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]" />
-                                      )}
-                                    </div>
-                                    {group.monitor.length > 0 ? group.monitor.map(d => {
-                                      const monOnline = (Date.now() - (d.status?.last_seen || 0)) < 60000;
-                                      return (
-                                        <div key={d.id} className="space-y-1">
-                                          <p className="text-xs font-mono font-bold text-white truncate">{d.id}</p>
-                                          <p className="text-[11px] text-slate-500">{d.info?.model || 'Nurse_Monitor_V2'}</p>
-                                          <div className="flex justify-between text-[11px] text-slate-400">
-                                            <span>IP: <span className="font-mono text-slate-300">{d.info?.ip || 'N/A'}</span></span>
-                                            <span className={monOnline ? 'text-emerald-400' : 'text-slate-500'}>{monOnline ? '● On' : '○ Off'}</span>
-                                          </div>
-                                        </div>
-                                      );
-                                    }) : (
-                                      <p className="text-[11px] text-slate-600 italic">No monitor assigned</p>
-                                    )}
-                                  </div>
-                                </div>
-
-                                {/* Room Actions */}
-                                <div className="flex gap-2 mt-3 pt-3 border-t border-slate-700/50">
-                                  {allDevices.map(d => (
-                                    <button
-                                      key={`edit-${d.id}`}
-                                      onClick={() => setEditingDevice(d.id)}
-                                      className="flex-1 py-1.5 bg-blue-600/15 text-blue-400 hover:bg-blue-600/25 rounded-lg transition text-[11px] font-medium flex items-center justify-center gap-1 truncate"
-                                      title={`Edit ${d.id}`}
-                                    >
-                                      <Settings size={10} /> {d.id.substring(0, 12)}
-                                    </button>
-                                  ))}
-                                  <button
-                                    onClick={() => {
-                                      if (window.confirm(`Unlink all devices from ${roomKey.replace('room_', 'Room ')}?`)) {
-                                        allDevices.forEach(d => handleUnlink(d.id));
-                                      }
-                                    }}
-                                    className="py-1.5 px-3 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-lg transition text-[11px]"
-                                    title="Unlink all from room"
-                                  >
-                                    <Unplug size={13} />
-                                  </button>
-                                </div>
-
-                                {/* Inline Edit (if editing any device in this room) */}
-                                {allDevices.some(d => editingDevice === d.id) && (() => {
-                                  const d = allDevices.find(d => editingDevice === d.id);
                                   return (
-                                    <div className="mt-3 p-4 bg-slate-950/60 rounded-xl border border-blue-500/20 space-y-3">
-                                      <div className="flex items-center gap-2">
-                                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-500/30">EDITING</span>
-                                        <span className="text-xs font-mono text-blue-400">{d.id}</span>
-                                      </div>
-                                      <div className="grid grid-cols-2 gap-3">
-                                        <div>
-                                          <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
-                                          <input type="text" defaultValue={roomKey.replace('room_', '')} id={`edit-room-${d.id}`}
-                                            className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="301" />
+                                    <div key={devName} className="flex items-center justify-between p-3 bg-slate-950/30 rounded-xl border border-white/5">
+                                      <div className="flex items-center gap-3">
+                                        <div className={cn("p-2 rounded-lg bg-slate-900", colorClass)}>
+                                          <Icon size={18} />
                                         </div>
                                         <div>
-                                          <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
-                                          <input type="text" defaultValue={d.config?.patient_name || roomData?.patient_info?.name || ''} id={`edit-patient-${d.id}`}
-                                            className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient" />
+                                          <p className="text-sm font-bold text-slate-200">{devName}</p>
+                                          <div className="flex gap-2 text-[10px] text-slate-500 font-mono mt-0.5">
+                                            {devData.ip && <span>IP: {devData.ip}</span>}
+                                            {devData.mac && <span className="hidden sm:inline">MAC: {devData.mac}</span>}
+                                          </div>
                                         </div>
                                       </div>
-                                      <div className="flex gap-2">
-                                        <button onClick={() => {
-                                          handleSaveConfig(d.id, document.getElementById(`edit-room-${d.id}`).value, document.getElementById(`edit-patient-${d.id}`).value);
-                                        }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
-                                          <Save size={14} /> Save
-                                        </button>
-                                        <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">Cancel</button>
+                                      <div className="text-right">
+                                        <span className={cn(
+                                          "text-xs font-bold px-2 py-1 rounded-full",
+                                          (status === 'Fall Down' || status === 'Emergency') ? "bg-red-500/20 text-red-400" :
+                                            isOnline ? "bg-emerald-500/10 text-emerald-400" : "bg-slate-700 text-slate-400"
+                                        )}>
+                                          {status}
+                                        </span>
+                                        {devData.Detection && (
+                                          <p className="text-[10px] text-slate-500 mt-1">
+                                            Detect: {devData.Detection}
+                                          </p>
+                                        )}
+                                        {devData.val !== undefined && (
+                                          <p className="text-[10px] text-slate-500 mt-1">
+                                            Val: {devData.val}
+                                          </p>
+                                        )}
                                       </div>
                                     </div>
                                   );
-                                })()}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* ====== PENDING (UNPAIRED) DEVICES ====== */}
-                  {pendingDevices.length > 0 && (
-                    <div className={pairedRooms.length > 0 ? "mt-6" : ""}>
-                      <h3 className="text-sm font-bold text-amber-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                        <AlertTriangle size={14} /> Pending Devices ({pendingDevices.length})
-                      </h3>
-                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                        {pendingDevices.map((device) => {
-                          const deviceId = device.id;
-                          const isEditing = editingDevice === deviceId;
-                          const isOnline = (Date.now() - (device.status?.last_seen || 0)) < 60000;
-                          const isCAM = device.info?.model?.toUpperCase().includes('CAM') || device.info?.type?.toUpperCase().includes('CAM');
-
-                          return (
-                            <div
-                              key={deviceId}
-                              className="p-4 rounded-xl border-2 border-amber-500/30 bg-slate-800/40 hover:border-amber-400/50 transition-all duration-300"
-                            >
-                              <div className="flex justify-between items-start mb-3">
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-center gap-2 mb-1">
-                                    <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
-                                    <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-900/60 text-amber-300 border border-amber-500/30">
-                                      PENDING
-                                    </span>
-                                  </div>
-                                  <h3 className="text-sm font-mono font-bold text-blue-400 truncate">{deviceId}</h3>
-                                  <p className="text-xs text-slate-500 mt-0.5">
-                                    {device.info?.model || 'Unknown'}
-                                    {device.info?.type ? ` • ${device.info.type}` : ''}
-                                  </p>
-                                </div>
-                                <div className="flex items-center gap-2 ml-2">
-                                  {isCAM ? <Camera size={14} className="text-blue-400" /> : <Monitor size={14} className="text-violet-400" />}
-                                  <span className={cn("w-2 h-2 rounded-full", isOnline ? "bg-emerald-500" : "bg-slate-600")} />
-                                </div>
-                              </div>
-
-                              <div className="space-y-1.5 mb-3 text-xs text-slate-400">
-                                <div className="flex justify-between">
-                                  <span>Type</span>
-                                  <span className={isCAM ? "text-blue-400 font-medium" : "text-violet-400 font-medium"}>
-                                    {isCAM ? '📷 Camera' : '🖥️ Monitor'}
-                                  </span>
-                                </div>
-                                <div className="flex justify-between">
-                                  <span>IP</span>
-                                  <span className="font-mono text-slate-300">{device.info?.ip || 'N/A'}</span>
-                                </div>
-                                <div className="flex justify-between">
-                                  <span>Network</span>
-                                  <span className={isOnline ? "text-emerald-400" : "text-slate-500"}>
-                                    {isOnline ? '● Online' : '○ Offline'}
-                                  </span>
-                                </div>
-                              </div>
-
-                              {isEditing ? (
-                                <div className="space-y-3 p-3 bg-slate-950/50 rounded-lg border border-slate-700">
-                                  <div>
-                                    <label className="block text-[11px] text-slate-500 mb-1">Room ID</label>
-                                    <input type="text" defaultValue="" id={`edit-room-${deviceId}`}
-                                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="e.g. 301" />
-                                  </div>
-                                  <div>
-                                    <label className="block text-[11px] text-slate-500 mb-1">Patient Name</label>
-                                    <input type="text" defaultValue="" id={`edit-patient-${deviceId}`}
-                                      className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:border-blue-500 outline-none" placeholder="Patient Name" />
-                                  </div>
-                                  <div className="flex gap-2">
-                                    <button onClick={() => {
-                                      handleSaveConfig(deviceId, document.getElementById(`edit-room-${deviceId}`).value, document.getElementById(`edit-patient-${deviceId}`).value);
-                                    }} className="flex-1 py-2 bg-emerald-600 text-white font-bold text-sm rounded-lg hover:bg-emerald-500 transition flex items-center justify-center gap-1">
-                                      <Save size={14} /> Pair & Save
-                                    </button>
-                                    <button onClick={() => setEditingDevice(null)} className="px-4 py-2 bg-slate-700 text-slate-300 text-sm rounded-lg hover:bg-slate-600 transition">
-                                      Cancel
-                                    </button>
-                                  </div>
-                                </div>
+                                })
                               ) : (
-                                <div className="space-y-2">
-                                  <div>
-                                    <label className="block text-[11px] text-slate-500 mb-1">Assign to Room:</label>
-                                    <div className="relative">
-                                      <select
-                                        value="none"
-                                        onChange={(e) => handleAssignRoom(deviceId, e.target.value)}
-                                        className="appearance-none w-full bg-slate-950 border border-slate-700 text-white py-2 px-3 pr-8 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
-                                      >
-                                        <option value="none">-- Select Room --</option>
-                                        {getRoomOptions().map(opt => (
-                                          <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                        ))}
-                                      </select>
-                                      <Settings size={14} className="absolute right-3 top-2.5 text-slate-500 pointer-events-none" />
-                                    </div>
-                                  </div>
-                                  <button
-                                    onClick={() => setEditingDevice(deviceId)}
-                                    className="w-full py-2 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded-lg transition text-xs font-medium flex items-center justify-center gap-1"
-                                  >
-                                    <Settings size={12} /> Manual Pair
-                                  </button>
+                                <div className="text-center py-6 text-slate-500 text-sm italic">
+                                  No devices configured.
                                 </div>
                               )}
                             </div>
-                          );
-                        })}
-                      </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  )}
-
-                  {/* Empty State */}
-                  {Object.keys(devices).length === 0 && (
-                    <div className="text-center py-16 text-slate-500">
-                      <Cpu size={48} className="mx-auto mb-4 opacity-30" />
-                      <p className="text-lg font-medium">No devices found</p>
-                      <p className="text-sm mt-1">Power on your ESP8266 or ESP32-S3-CAM to see them here.</p>
-                    </div>
-                  )}
-                </div>
+                  </div>
+                ))}
               </div>
             );
           })()
         }
 
 
+
+
       </main >
 
       <SpeedInsights />
+
+      {/* --- MODALS --- */}
+
+      {/* 1. Resolution Confirmation Modal — Premium Redesign */}
+      {resolvingRoom && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)' }}
+          onClick={(e) => { if (e.target === e.currentTarget) setResolvingRoom(null); }}
+        >
+          <div className="relative bg-slate-900 border border-amber-500/30 rounded-3xl w-full max-w-md shadow-[0_0_60px_rgba(245,158,11,0.15)] overflow-hidden">
+
+            {/* Glowing top bar */}
+            <div className="h-1 w-full bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500" />
+
+            {/* Header */}
+            <div className="px-8 pt-8 pb-6 text-center space-y-4">
+              {/* Animated Icon */}
+              <div className="relative mx-auto w-20 h-20">
+                <div className="absolute inset-0 rounded-full bg-amber-500/20 animate-ping" />
+                <div className="relative w-20 h-20 rounded-full bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center shadow-lg shadow-amber-500/30">
+                  <Stethoscope size={36} className="text-white" />
+                </div>
+              </div>
+
+              <div>
+                <p className="text-xs font-bold uppercase tracking-widest text-amber-400 mb-1">Assistance Protocol</p>
+                <h2 className="text-2xl font-bold text-white">Patient Assistance Complete?</h2>
+                <p className="text-slate-400 text-sm mt-2">
+                  Confirm that emergency in{' '}
+                  <span className="text-amber-400 font-bold">
+                    {resolvingRoom.wardKey?.replace('ward_', 'Ward ')} — {resolvingRoom.roomKey?.replace('room_', 'Room ')}
+                  </span>{' '}
+                  has been fully resolved.
+                </p>
+              </div>
+            </div>
+
+            {/* Checklist */}
+            <div className="mx-6 mb-6 bg-slate-950/60 rounded-2xl border border-slate-800 p-4 space-y-3">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-3">Pre-Reset Checklist</p>
+              {[
+                { icon: '🩺', text: 'Patient has been assessed by staff' },
+                { icon: '🔔', text: 'Physical alarms have been silenced' },
+                { icon: '📡', text: 'All monitoring devices are operational' },
+              ].map((item, i) => (
+                <div key={i} className="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-800/40 transition-colors">
+                  <span className="text-lg">{item.icon}</span>
+                  <span className="text-sm text-slate-300">{item.text}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Action Buttons */}
+            <div className="px-6 pb-8 grid grid-cols-2 gap-3">
+              <button
+                onClick={() => setResolvingRoom(null)}
+                className="py-3.5 px-4 bg-slate-800/80 hover:bg-slate-700 text-slate-300 font-bold rounded-2xl border border-slate-700 hover:border-slate-500 transition-all active:scale-95 flex items-center justify-center gap-2"
+              >
+                <X size={18} /> Cancel
+              </button>
+              <button
+                onClick={confirmResolution}
+                className="py-3.5 px-4 bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-slate-900 font-bold rounded-2xl transition-all active:scale-95 shadow-lg shadow-amber-900/30 flex items-center justify-center gap-2"
+              >
+                <CheckCircle size={18} /> Confirm & Clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2. Room Details Modal */}
+      {viewingRoom && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+
+            {/* Header */}
+            <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-800/30">
+              <div>
+                <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                  <LayoutDashboard className="text-blue-400" size={24} />
+                  {viewingRoom.roomKey.replace('room_', 'Room ')} Details
+                </h2>
+                <p className="text-slate-400 text-sm mt-1">
+                  Patient: <span className="text-slate-200 font-bold">{viewingRoom.patient_info?.name || viewingRoom.config?.patient_name || 'Unassigned'}</span>
+                </p>
+              </div>
+              <button
+                onClick={() => setViewingRoom(null)}
+                className="p-2 hover:bg-slate-800 rounded-full text-slate-400 hover:text-white transition-colors"
+              >
+                <X size={24} />
+              </button>
+            </div>
+
+            {/* Scrollable Content */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-6">
+
+              {/* Status Section */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="bg-slate-950 p-4 rounded-xl border border-slate-800">
+                  <p className="text-xs text-slate-500 mb-1 font-bold uppercase">Current Status</p>
+                  <div className="flex items-center gap-2">
+                    {viewingRoom.live_status?.fall_detected ? (
+                      <>
+                        <ShieldAlert className="text-red-500" />
+                        <span className="text-red-500 font-bold">Fall Detected</span>
+                      </>
+                    ) : (
+                      <>
+                        <Activity className="text-emerald-500" />
+                        <span className="text-emerald-500 font-bold">Normal Monitoring</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="bg-slate-950 p-4 rounded-xl border border-slate-800">
+                  <p className="text-xs text-slate-500 mb-1 font-bold uppercase">Last Update</p>
+                  <p className="text-slate-300 font-mono text-sm">
+                    {viewingRoom.fall_detection?.last_update || "No Data"}
+                  </p>
+                </div>
+              </div>
+
+              {/* Devices List */}
+              <div>
+                <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider mb-3">Connected Devices</h3>
+                <div className="space-y-3">
+                  {Object.entries(viewingRoom.devices || {}).filter(([n]) => n !== 'Pir_Motion_Sensor').map(([devName, devData]) => (
+                    <div key={devName} className="bg-slate-800/40 p-4 rounded-xl border border-slate-700/50 flex flex-col sm:flex-row justify-between gap-4">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-slate-900 rounded-lg text-blue-400">
+                          {devName.includes('CAM') ? <Camera size={20} /> : <Cpu size={20} />}
+                        </div>
+                        <div>
+                          <p className="font-bold text-slate-200">{devName}</p>
+                          <p className="text-xs text-slate-500 font-mono mt-0.5">IP: {devData.ip || 'N/A'}</p>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <span className={cn(
+                          "text-xs font-bold px-2 py-1 rounded-full inline-block mb-1",
+                          (devData.Status === 'Normal' || devData.status === 'Online') ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-500"
+                        )}>
+                          {devData.Status || devData.status || 'Offline'}
+                        </span>
+                        {devData.stream_url && (
+                          <div className="mt-1">
+                            <a href={devData.stream_url} target="_blank" rel="noopener" className="text-xs text-blue-400 hover:underline flex items-center justify-end gap-1">
+                              View Stream <ExternalLink size={10} />
+                            </a>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {Object.keys(viewingRoom.devices || {}).filter(n => n !== 'Pir_Motion_Sensor').length === 0 && (
+                    <p className="text-slate-500 italic text-sm text-center py-4">No devices connected.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-slate-800 bg-slate-900 flex justify-end">
+              <button
+                onClick={() => setViewingRoom(null)}
+                className="px-6 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-bold transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div >
   );
 }
