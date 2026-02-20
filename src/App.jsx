@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+﻿import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { initializeApp } from "firebase/app";
 import { getDatabase, ref, onValue, update } from "firebase/database";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
-import { getAnalytics } from "firebase/analytics";
+import { getAnalytics, logEvent } from "firebase/analytics";
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import {
   Activity,
@@ -24,7 +24,10 @@ import {
   Link2,
   CheckCircle,
   Stethoscope,
-  XCircle
+  XCircle,
+  ScrollText,
+  Filter,
+  Trash2
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -48,9 +51,40 @@ const firebaseConfig = {
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app); // Initialize Analytics
+const analytics = getAnalytics(app);
 const db = getDatabase(app);
 const auth = getAuth(app);
+
+// --- Central Log Writer ---
+// Writes to RTDB hospital_system/logs/{timestamp} AND Firebase Analytics
+const LOG_TYPES = {
+  FALL_DETECTED: { label: 'Fall Detected', color: 'red', icon: '๐จ' },
+  ACKNOWLEDGED: { label: 'Alarm Acknowledged', color: 'amber', icon: 'โ…' },
+  RESOLVED: { label: 'Assistance Complete', color: 'green', icon: '๐ฉบ' },
+  DEVICE_CHANGE: { label: 'Device Status Change', color: 'blue', icon: '๐“ก' },
+  MUTE: { label: 'Alarm Muted', color: 'slate', icon: '๐”' },
+  UNMUTE: { label: 'Alarm Unmuted', color: 'slate', icon: '๐”' },
+  SYSTEM: { label: 'System', color: 'slate', icon: 'โน๏ธ' },
+};
+
+async function writeLog(type, message, meta = {}) {
+  try {
+    const ts = Date.now();
+    const entry = {
+      type,
+      message,
+      meta,
+      timestamp: ts,
+      isoTime: new Date(ts).toISOString(),
+    };
+    // Write to RTDB (last 500 entries โ€” use timestamp as key)
+    await update(ref(db, `hospital_system/logs/${ts}`), entry);
+    // Send to Firebase Analytics
+    logEvent(analytics, type.toLowerCase(), { message, ...meta });
+  } catch (e) {
+    console.warn('writeLog failed:', e);
+  }
+}
 
 // --- Audio System (Mobile Optimized) ---
 class AlarmSound {
@@ -244,17 +278,20 @@ class AlarmSound {
 
 // --- Main App Component ---
 export default function App() {
-  const [activeTab, setActiveTab] = useState('monitor'); // 'monitor' | 'devices'
+  const [activeTab, setActiveTab] = useState('monitor'); // 'monitor' | 'devices' | 'logs'
   const [loading, setLoading] = useState(true);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState(null);
 
   // Data State
-  // Data State
   const [wardsData, setWardsData] = useState({});
   const [devices, setDevices] = useState({});
-  const [sensorData, setSensorData] = useState({}); // /sensor_data (global fall status from ESP)
+  const [sensorData, setSensorData] = useState({});
   const [editingDevice, setEditingDevice] = useState(null);
+
+  // Logs State
+  const [logs, setLogs] = useState([]);
+  const [logFilter, setLogFilter] = useState('ALL'); // 'ALL' | type keys
 
   const handleSaveConfig = async (deviceId, roomId, patientName) => {
     try {
@@ -340,7 +377,7 @@ export default function App() {
     const isPlaceholderKey = !firebaseConfig.apiKey || firebaseConfig.apiKey === 'your-api-key-here';
 
     if (isPlaceholderKey) {
-      console.warn("⚠️ No valid API Key found. Skipping Auth and attempting direct DB connection.");
+      console.warn("โ ๏ธ No valid API Key found. Skipping Auth and attempting direct DB connection.");
       // Try to listen without auth (works if rules are .read: true)
       setupListeners();
 
@@ -351,7 +388,7 @@ export default function App() {
     } else {
       signInAnonymously(auth)
         .then(() => {
-          console.log("🔥 Firebase Auth: Signed in anonymously");
+          console.log("๐”ฅ Firebase Auth: Signed in anonymously");
           setupListeners();
         })
         .catch((err) => {
@@ -410,25 +447,25 @@ export default function App() {
         const someOnline = significantDevices.some(d => {
           const s = (d.Status || d.status || '').toLowerCase();
           if (s === 'online' || s === 'normal') return true;
-          // Device reported to DB but has no Status key → treat as online
+          // Device reported to DB but has no Status key โ’ treat as online
           if (!d.Status && !d.status) return true;
           return false;
         });
         if (someOnline) isOffline = false;
       } else {
-        // Only sensors → assume online
+        // Only sensors โ’ assume online
         isOffline = false;
       }
 
       // --- Fall Detection: Read from `Status` field ONLY ---
       // `Detection: "Yes"` = camera sees a person (presence), NOT a fall signal.
       // `Status` is the authoritative alarm field from the ESP32:
-      //   "Normal"  → No alarm
-      //   Anything else (e.g. "Fall Down", "Emergency", "Fall") → ALARM
+      //   "Normal"  โ’ No alarm
+      //   Anything else (e.g. "Fall Down", "Emergency", "Fall") โ’ ALARM
       const deviceFall = devValues.some(d => {
         const s = (d.Status || d.status || '').toLowerCase();
 
-        // No Status reported → not a fall from this device
+        // No Status reported โ’ not a fall from this device
         if (!s) return false;
 
         // "Normal" and "Online" are the only non-alarm states
@@ -461,7 +498,6 @@ export default function App() {
         const { isFall, isAck } = getRoomLogic(room);
         if (isFall) {
           anyFall = true;
-          console.log(`[DEBUG] Fall Detected in ${wardName}/${roomKey} | Ack: ${isAck}`, room); // DEBUG
           if (!isAck) {
             unackedCount++;
             alertRoomName = `${wardName.replace('ward_', '')} - ${roomKey.replace('room_', '')}`;
@@ -479,18 +515,44 @@ export default function App() {
     setActiveAlert(anyFall);
 
     if (unackedCount > 0 && !alarmAcknowledged) {
-      // Only trigger notification if unacked
       if ("Notification" in window && Notification.permission === "granted") {
-        try {
-          new Notification("FALL DETECTED!", { body: alertRoomName });
-        } catch (e) { }
+        try { new Notification("FALL DETECTED!", { body: alertRoomName }); } catch (e) { }
       }
     }
   }, [wardsData, activeAlert, alarmAcknowledged]);
 
+  // --- Log New Fall Events to RTDB (tracks first-occurrence only) ---
+  const prevFallRooms = useRef(new Set());
+  useEffect(() => {
+    Object.entries(wardsData).forEach(([wardKey, ward]) => {
+      Object.entries(ward).forEach(([roomKey, room]) => {
+        const { isFall } = getRoomLogic(room);
+        const key = `${wardKey}/${roomKey}`;
+        if (isFall && !prevFallRooms.current.has(key)) {
+          writeLog('FALL_DETECTED', `Fall detected in ${wardKey} / ${roomKey}`, { wardKey, roomKey });
+          prevFallRooms.current.add(key);
+        } else if (!isFall) {
+          prevFallRooms.current.delete(key);
+        }
+      });
+    });
+  }, [wardsData]);
+
+  // --- Subscribe to Logs from RTDB (real-time) ---
+  useEffect(() => {
+    const logsRef = ref(db, 'hospital_system/logs');
+    const unsub = onValue(logsRef, (snap) => {
+      const data = snap.val() || {};
+      const arr = Object.values(data)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 200);
+      setLogs(arr);
+    });
+    return () => unsub();
+  }, []);
+
   // Handle Audio Alarm
-  // NOTE: We recompute fall state here directly — do NOT rely on the `activeAlert`
-  // state value since it may be stale (set by a sibling useEffect in the same render).
+  // NOTE: recompute fall state inline โ€” do NOT rely on stale `activeAlert` state.
   useEffect(() => {
     let anyUnacked = false;
     Object.values(wardsData).forEach(ward => {
@@ -500,11 +562,7 @@ export default function App() {
       });
     });
 
-    console.log("🔔 Alarm Check:", { anyUnacked, isMuted, alarmAcknowledged });
-
-    // Use `anyUnacked` directly — no dependency on stale `activeAlert`
     if (anyUnacked && !isMuted && !alarmAcknowledged) {
-      console.log("▶️  PLAYING alarm");
       alarmRef.current?.play();
     } else {
       alarmRef.current?.stop();
@@ -516,30 +574,32 @@ export default function App() {
       const roomRef = ref(db, `hospital_system/wards/${wardKey}/${roomKey}/live_status`);
       await update(roomRef, { acknowledged: true });
       setAlarmAcknowledged(true);
+      writeLog('ACKNOWLEDGED', `Alarm acknowledged in ${wardKey} / ${roomKey}`, { wardKey, roomKey });
     } catch (err) { console.error(err); }
   };
 
   const handleAcknowledgeAll = async () => {
     const updates = {};
+    const rooms = [];
     Object.entries(wardsData).forEach(([wardKey, ward]) => {
       Object.entries(ward).forEach(([roomKey, room]) => {
         const { isFall, isAck } = getRoomLogic(room);
         if (isFall && !isAck) {
           updates[`hospital_system/wards/${wardKey}/${roomKey}/live_status/acknowledged`] = true;
+          rooms.push(`${wardKey}/${roomKey}`);
         }
       });
     });
-
     if (Object.keys(updates).length > 0) {
       await update(ref(db), updates);
       setAlarmAcknowledged(true);
+      writeLog('ACKNOWLEDGED', `All alarms acknowledged`, { rooms });
     }
   };
 
   const confirmResolution = async () => {
     if (!resolvingRoom) return;
     const { wardKey, roomKey } = resolvingRoom;
-
     try {
       const roomRef = ref(db, `hospital_system/wards/${wardKey}/${roomKey}`);
       await update(roomRef, {
@@ -550,6 +610,7 @@ export default function App() {
         "devices/ESP32_S3_CAM/Status": "Normal",
         "devices/ESP32_S3_CAM/Detection": "No"
       });
+      writeLog('RESOLVED', `Patient assistance complete in ${wardKey} / ${roomKey}`, { wardKey, roomKey });
       setResolvingRoom(null);
     } catch (err) {
       console.error("Resolution Error:", err);
@@ -557,7 +618,6 @@ export default function App() {
     }
   };
 
-  // Global Auto-Unlock (Any interaction enabling audio)
   useEffect(() => {
     const unlockAudio = () => {
       if (alarmRef.current) {
@@ -588,6 +648,13 @@ export default function App() {
       document.removeEventListener('touchend', unlockHandler);
     };
   }, []);
+
+  // Mute toggle with logging
+  const handleToggleMute = () => {
+    const next = !isMuted;
+    setIsMuted(next);
+    writeLog(next ? 'MUTE' : 'UNMUTE', next ? 'Alarm sound muted by nurse' : 'Alarm sound unmuted by nurse');
+  };
 
   if (loading) {
     return (
@@ -645,11 +712,26 @@ export default function App() {
             <Cpu size={18} />
             Device Manager
           </button>
+          <button
+            onClick={() => setActiveTab('logs')}
+            className={cn(
+              "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all relative",
+              activeTab === 'logs' ? "bg-blue-600 text-white shadow-lg" : "text-slate-400 hover:bg-slate-800"
+            )}
+          >
+            <ScrollText size={18} />
+            History
+            {logs.filter(l => l.type === 'FALL_DETECTED').length > 0 && (
+              <span className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 rounded-full text-[10px] flex items-center justify-center text-white font-bold">
+                {logs.filter(l => l.type === 'FALL_DETECTED').length > 9 ? '9+' : logs.filter(l => l.type === 'FALL_DETECTED').length}
+              </span>
+            )}
+          </button>
         </div>
 
         <div className="flex items-center gap-3">
           <button
-            onClick={() => setIsMuted(!isMuted)}
+            onClick={handleToggleMute}
             className={cn(
               "relative p-2.5 rounded-lg transition-colors border border-transparent",
               isMuted ? "bg-red-500/10 text-red-500 border-red-500/20" : "text-slate-400 hover:bg-slate-800 hover:text-white",
@@ -658,7 +740,7 @@ export default function App() {
             title={isMuted ? "Unmute" : "Mute"}
           >
             {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
-            {!audioReady && <span className="absolute -top-1 -right-1 flex h-3 w-3"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-yellow-400 opacity-75"></span><span className="relative inline-flex rounded-full h-3 w-3 bg-yellow-500"></span></span>}
+            {!audioReady && <span className="absolute -top-1 -right-1 flex h-3 w-3"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-yellow-400 opacity-75" /><span className="relative inline-flex rounded-full h-3 w-3 bg-yellow-500" /></span>}
           </button>
           <div className="hidden md:block px-4 py-2 bg-slate-800 rounded-lg text-sm text-slate-300 font-medium">
             {new Date().toLocaleDateString('th-TH', { weekday: 'short', day: 'numeric', month: 'short' })}
@@ -681,7 +763,7 @@ export default function App() {
               rel="noopener noreferrer"
               className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-bold text-sm transition-colors shadow-lg whitespace-nowrap"
             >
-              Get API Key →
+              Get API Key โ’
             </a>
           )}
         </div>
@@ -820,7 +902,7 @@ export default function App() {
                             )}>
                               {isEmergency && <AlertTriangle size={14} />}
                               {isWaiting && <Stethoscope size={14} />}
-                              {isEmergency ? "🚨 FALL DETECTED" : isWaiting ? "WAITING FOR HELP" : "Normal"}
+                              {isEmergency ? "๐จ FALL DETECTED" : isWaiting ? "WAITING FOR HELP" : "Normal"}
                             </span>
                           </div>
 
@@ -888,7 +970,7 @@ export default function App() {
                     <div>
                       <h2 className="text-xl font-bold text-white flex items-center gap-2">
                         <Cpu className="text-blue-400" />
-                        🔌 System Hardware Status
+                        ๐” System Hardware Status
                       </h2>
                       <p className="text-slate-400 text-sm mt-1">
                         Real-time status of all devices across all wards.
@@ -1037,13 +1119,82 @@ export default function App() {
 
 
 
+
+        {/* --- History / Logs Tab --- */}
+        {activeTab === 'logs' && (
+          <div className="space-y-4">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                  <ScrollText className="text-blue-400" size={22} />
+                  Event History
+                </h2>
+                <p className="text-sm text-slate-500 mt-0.5">{logs.length} events recorded</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {['ALL', ...Object.keys(LOG_TYPES)].map(f => (
+                  <button
+                    key={f}
+                    onClick={() => setLogFilter(f)}
+                    className={cn(
+                      "px-3 py-1.5 text-xs font-bold rounded-full border transition-all",
+                      logFilter === f
+                        ? "bg-blue-600 border-blue-500 text-white"
+                        : "bg-slate-800/60 border-slate-700 text-slate-400 hover:border-slate-500"
+                    )}
+                  >
+                    {f === 'ALL' ? 'All Events' : (`${LOG_TYPES[f]?.icon} ${LOG_TYPES[f]?.label}`)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-2">
+              {(() => {
+                const filtered = logFilter === 'ALL' ? logs : logs.filter(l => l.type === logFilter);
+                if (filtered.length === 0) {
+                  return (
+                    <div className="flex flex-col items-center justify-center py-20 text-slate-600">
+                      <ScrollText size={48} className="mb-4 opacity-30" />
+                      <p className="text-lg font-semibold">No events recorded yet</p>
+                      <p className="text-sm mt-1">Events appear when falls, acknowledgments, or resolutions occur.</p>
+                    </div>
+                  );
+                }
+                return filtered.map((log, i) => {
+                  const cfg = LOG_TYPES[log.type] || LOG_TYPES.SYSTEM;
+                  const colorMap = { red:'border-red-500/30 bg-red-500/5 hover:bg-red-500/10', amber:'border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10', green:'border-green-500/30 bg-green-500/5 hover:bg-green-500/10', blue:'border-blue-500/30 bg-blue-500/5 hover:bg-blue-500/10', slate:'border-slate-700/50 bg-slate-800/30 hover:bg-slate-800/60' };
+                  const badgeMap = { red:'bg-red-500/20 text-red-400', amber:'bg-amber-500/20 text-amber-400', green:'bg-green-500/20 text-green-400', blue:'bg-blue-500/20 text-blue-400', slate:'bg-slate-700 text-slate-400' };
+                  const d = new Date(log.timestamp);
+                  const timeStr = d.toLocaleTimeString('th-TH', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+                  const dateStr = d.toLocaleDateString('th-TH', { day:'numeric', month:'short', year:'2-digit' });
+                  return (
+                    <div key={String(log.timestamp)+i} className={cn("flex items-start gap-4 p-4 rounded-xl border transition-colors", colorMap[cfg.color]||colorMap.slate)}>
+                      <div className="text-2xl leading-none mt-0.5 shrink-0">{cfg.icon}</div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                          <span className={cn("text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full", badgeMap[cfg.color]||badgeMap.slate)}>{cfg.label}</span>
+                          {log.meta?.wardKey && <span className="text-[11px] text-slate-500 font-mono">{String(log.meta.wardKey).replace('ward_','Ward ')} / {String(log.meta.roomKey||'').replace('room_','Room ')}</span>}
+                        </div>
+                        <p className="text-sm text-slate-300 break-words">{log.message}</p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-xs font-mono text-slate-300">{timeStr}</p>
+                        <p className="text-[10px] text-slate-600 mt-0.5">{dateStr}</p>
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        )}
       </main >
 
       <SpeedInsights />
 
       {/* --- MODALS --- */}
 
-      {/* 1. Resolution Confirmation Modal — Premium Redesign */}
+      {/* 1. Resolution Confirmation Modal โ€” Premium Redesign */}
       {resolvingRoom && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
@@ -1071,7 +1222,7 @@ export default function App() {
                 <p className="text-slate-400 text-sm mt-2">
                   Confirm that emergency in{' '}
                   <span className="text-amber-400 font-bold">
-                    {resolvingRoom.wardKey?.replace('ward_', 'Ward ')} — {resolvingRoom.roomKey?.replace('room_', 'Room ')}
+                    {resolvingRoom.wardKey?.replace('ward_', 'Ward ')} โ€” {resolvingRoom.roomKey?.replace('room_', 'Room ')}
                   </span>{' '}
                   has been fully resolved.
                 </p>
@@ -1082,9 +1233,9 @@ export default function App() {
             <div className="mx-6 mb-6 bg-slate-950/60 rounded-2xl border border-slate-800 p-4 space-y-3">
               <p className="text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-3">Pre-Reset Checklist</p>
               {[
-                { icon: '🩺', text: 'Patient has been assessed by staff' },
-                { icon: '🔔', text: 'Physical alarms have been silenced' },
-                { icon: '📡', text: 'All monitoring devices are operational' },
+                { icon: '๐ฉบ', text: 'Patient has been assessed by staff' },
+                { icon: '๐””', text: 'Physical alarms have been silenced' },
+                { icon: '๐“ก', text: 'All monitoring devices are operational' },
               ].map((item, i) => (
                 <div key={i} className="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-800/40 transition-colors">
                   <span className="text-lg">{item.icon}</span>
