@@ -300,6 +300,10 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [logFilter, setLogFilter] = useState('ALL'); // 'ALL' | type keys
 
+  // Unread log badge: tracks how many logs were seen on last History visit
+  const seenLogCount = useRef(0);
+  const unreadLogCount = Math.max(0, logs.length - seenLogCount.current);
+
   const handleSaveConfig = async (deviceId, roomId, patientName) => {
     try {
       if (!roomId) return alert("Room ID cannot be empty");
@@ -721,7 +725,10 @@ export default function App() {
             Device Manager
           </button>
           <button
-            onClick={() => setActiveTab('logs')}
+            onClick={() => {
+              setActiveTab('logs');
+              seenLogCount.current = logs.length; // mark all as seen
+            }}
             className={cn(
               "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all relative",
               activeTab === 'logs' ? "bg-blue-600 text-white shadow-lg" : "text-slate-400 hover:bg-slate-800"
@@ -729,9 +736,9 @@ export default function App() {
           >
             <ScrollText size={18} />
             History
-            {logs.filter(l => l.type === 'FALL_DETECTED').length > 0 && (
-              <span className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 rounded-full text-[10px] flex items-center justify-center text-white font-bold">
-                {logs.filter(l => l.type === 'FALL_DETECTED').length > 9 ? '9+' : logs.filter(l => l.type === 'FALL_DETECTED').length}
+            {unreadLogCount > 0 && activeTab !== 'logs' && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 bg-red-500 rounded-full text-[10px] flex items-center justify-center text-white font-bold shadow-lg shadow-red-500/40">
+                {unreadLogCount > 99 ? '99+' : unreadLogCount}
               </span>
             )}
           </button>
