@@ -3,6 +3,7 @@ import { initializeApp } from "firebase/app";
 import { getDatabase, ref, onValue, update } from "firebase/database";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import { getAnalytics, logEvent } from "firebase/analytics";
+import { getFirestore, collection, addDoc, query, orderBy, limit, onSnapshot, serverTimestamp } from "firebase/firestore";
 import { SpeedInsights } from '@vercel/speed-insights/react';
 import {
   Activity,
@@ -52,7 +53,8 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const analytics = getAnalytics(app);
-const db = getDatabase(app);
+const db = getDatabase(app);   // Realtime Database (real-time UI feed)
+const fsdb = getFirestore(app); // Firestore (permanent log storage)
 const auth = getAuth(app);
 
 // --- Central Log Writer ---
@@ -76,16 +78,21 @@ async function writeLog(type, message, meta = {}) {
       meta,
       timestamp: ts,
       isoTime: new Date(ts).toISOString(),
+      createdAt: serverTimestamp(),  // Firestore server-side timestamp
     };
-    // Write to RTDB (last 500 entries โ€” use timestamp as key)
+
+    // 1. Firestore — permanent log collection (persistent audit trail)
+    await addDoc(collection(fsdb, 'logs'), entry);
+
+    // 2. RTDB — real-time UI feed (timestamp as key, auto-sorted)
     await update(ref(db, `hospital_system/logs/${ts}`), entry);
-    // Send to Firebase Analytics
+
+    // 3. Firebase Analytics — event tracking
     logEvent(analytics, type.toLowerCase(), { message, ...meta });
   } catch (e) {
     console.warn('writeLog failed:', e);
   }
 }
-
 // --- Audio System (Mobile Optimized) ---
 class AlarmSound {
   constructor() {
@@ -538,14 +545,15 @@ export default function App() {
     });
   }, [wardsData]);
 
-  // --- Subscribe to Logs from RTDB (real-time) ---
+  // --- Subscribe to Logs from Firestore (permanent history) ---
   useEffect(() => {
-    const logsRef = ref(db, 'hospital_system/logs');
-    const unsub = onValue(logsRef, (snap) => {
-      const data = snap.val() || {};
-      const arr = Object.values(data)
-        .sort((a, b) => b.timestamp - a.timestamp)
-        .slice(0, 200);
+    const logsQuery = query(
+      collection(fsdb, 'logs'),
+      orderBy('timestamp', 'desc'),
+      limit(200)
+    );
+    const unsub = onSnapshot(logsQuery, (snap) => {
+      const arr = snap.docs.map(d => d.data());
       setLogs(arr);
     });
     return () => unsub();
