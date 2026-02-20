@@ -397,30 +397,45 @@ export default function App() {
     else isAck = false;
 
     if (hasDevices) {
-      // Generic Online Check: If Any CAM/Monitor is Online
-      // Filter for significant devices (usually have IP or specific roles)
-      const significantDevices = devValues.filter(d => d.ip || d.Role === 'Monitor' || d.model?.includes('CAM'));
-
-      const significantOnline = significantDevices.filter(d => {
-        const s = (d.Status || d.status || '').toLowerCase();
-        return s === 'online' || s === 'normal';
-      });
+      // --- Online Check ---
+      // Significant = devices with IP, CAM model, or known monitor role
+      const significantDevices = devValues.filter(d =>
+        d.ip || d.model?.toLowerCase().includes('cam') || d.model?.toLowerCase().includes('monitor')
+      );
 
       if (significantDevices.length > 0) {
-        if (significantOnline.length > 0) isOffline = false;
+        // A device is online if:
+        //   a) Status/status is 'online' or 'normal'
+        //   b) OR it has an IP but NO Status field at all (presence in DB = alive)
+        const someOnline = significantDevices.some(d => {
+          const s = (d.Status || d.status || '').toLowerCase();
+          if (s === 'online' || s === 'normal') return true;
+          // Device reported to DB but has no Status key → treat as online
+          if (!d.Status && !d.status) return true;
+          return false;
+        });
+        if (someOnline) isOffline = false;
       } else {
-        isOffline = false; // Sensors usually don't have "Offline" status
+        // Only sensors → assume online
+        isOffline = false;
       }
 
-      // Fall Detection (Generic - Case Insensitive)
+      // --- Fall Detection: Read from `Status` field ONLY ---
+      // `Detection: "Yes"` = camera sees a person (presence), NOT a fall signal.
+      // `Status` is the authoritative alarm field from the ESP32:
+      //   "Normal"  → No alarm
+      //   Anything else (e.g. "Fall Down", "Emergency", "Fall") → ALARM
       const deviceFall = devValues.some(d => {
         const s = (d.Status || d.status || '').toLowerCase();
-        const detect = (d.Detection || '').toLowerCase();
 
-        if (s === 'fall down' || s === 'emergency' || s === 'fall') return true;
-        if (s.includes('fall detected')) return true;
-        if (detect === 'yes') return true;
-        return false;
+        // No Status reported → not a fall from this device
+        if (!s) return false;
+
+        // "Normal" and "Online" are the only non-alarm states
+        if (s === 'normal' || s === 'online') return false;
+
+        // Any other Status value means alarm state
+        return true;
       });
       isFall = deviceFall || legacyFall;
     } else {
@@ -474,6 +489,8 @@ export default function App() {
   }, [wardsData, activeAlert, alarmAcknowledged]);
 
   // Handle Audio Alarm
+  // NOTE: We recompute fall state here directly — do NOT rely on the `activeAlert`
+  // state value since it may be stale (set by a sibling useEffect in the same render).
   useEffect(() => {
     let anyUnacked = false;
     Object.values(wardsData).forEach(ward => {
@@ -483,17 +500,16 @@ export default function App() {
       });
     });
 
-    // Debug Alarm Logic
-    console.log("Alarm Check:", { activeAlert, anyUnacked, isMuted, alarmAcknowledged, audioReady });
+    console.log("🔔 Alarm Check:", { anyUnacked, isMuted, alarmAcknowledged });
 
-    if (activeAlert && anyUnacked && !isMuted && !alarmAcknowledged) {
-      console.log("Attempting to PLAY alarm...");
+    // Use `anyUnacked` directly — no dependency on stale `activeAlert`
+    if (anyUnacked && !isMuted && !alarmAcknowledged) {
+      console.log("▶️  PLAYING alarm");
       alarmRef.current?.play();
     } else {
-      console.log("Stopping alarm...");
       alarmRef.current?.stop();
     }
-  }, [wardsData, activeAlert, isMuted, alarmAcknowledged, audioReady]);
+  }, [wardsData, isMuted, alarmAcknowledged]);
 
   const handleAcknowledge = async (wardKey, roomKey) => {
     try {
