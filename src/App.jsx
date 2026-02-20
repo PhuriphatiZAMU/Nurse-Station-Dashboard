@@ -58,13 +58,13 @@ const auth = getAuth(app);
 // --- Central Log Writer ---
 // Writes to RTDB hospital_system/logs/{timestamp} AND Firebase Analytics
 const LOG_TYPES = {
-  FALL_DETECTED: { label: 'Fall Detected', color: 'red', icon: '๐จ' },
-  ACKNOWLEDGED: { label: 'Alarm Acknowledged', color: 'amber', icon: 'โ…' },
-  RESOLVED: { label: 'Assistance Complete', color: 'green', icon: '๐ฉบ' },
-  DEVICE_CHANGE: { label: 'Device Status Change', color: 'blue', icon: '๐“ก' },
-  MUTE: { label: 'Alarm Muted', color: 'slate', icon: '๐”' },
-  UNMUTE: { label: 'Alarm Unmuted', color: 'slate', icon: '๐”' },
-  SYSTEM: { label: 'System', color: 'slate', icon: 'โน๏ธ' },
+  FALL_DETECTED: { label: 'Fall Detected', color: 'red' },
+  ACKNOWLEDGED: { label: 'Alarm Acknowledged', color: 'amber' },
+  RESOLVED: { label: 'Assistance Complete', color: 'green' },
+  DEVICE_CHANGE: { label: 'Device Status Change', color: 'blue' },
+  MUTE: { label: 'Alarm Muted', color: 'slate' },
+  UNMUTE: { label: 'Alarm Unmuted', color: 'slate' },
+  SYSTEM: { label: 'System', color: 'slate' },
 };
 
 async function writeLog(type, message, meta = {}) {
@@ -1143,7 +1143,7 @@ export default function App() {
                         : "bg-slate-800/60 border-slate-700 text-slate-400 hover:border-slate-500"
                     )}
                   >
-                    {f === 'ALL' ? 'All Events' : (`${LOG_TYPES[f]?.icon} ${LOG_TYPES[f]?.label}`)}
+                    {f === 'ALL' ? 'All Events' : (LOG_TYPES[f]?.label || f)}
                   </button>
                 ))}
               </div>
@@ -1162,18 +1162,26 @@ export default function App() {
                 }
                 return filtered.map((log, i) => {
                   const cfg = LOG_TYPES[log.type] || LOG_TYPES.SYSTEM;
-                  const colorMap = { red:'border-red-500/30 bg-red-500/5 hover:bg-red-500/10', amber:'border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10', green:'border-green-500/30 bg-green-500/5 hover:bg-green-500/10', blue:'border-blue-500/30 bg-blue-500/5 hover:bg-blue-500/10', slate:'border-slate-700/50 bg-slate-800/30 hover:bg-slate-800/60' };
-                  const badgeMap = { red:'bg-red-500/20 text-red-400', amber:'bg-amber-500/20 text-amber-400', green:'bg-green-500/20 text-green-400', blue:'bg-blue-500/20 text-blue-400', slate:'bg-slate-700 text-slate-400' };
+                  const colorMap = { red: 'border-red-500/30 bg-red-500/5 hover:bg-red-500/10', amber: 'border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10', green: 'border-green-500/30 bg-green-500/5 hover:bg-green-500/10', blue: 'border-blue-500/30 bg-blue-500/5 hover:bg-blue-500/10', slate: 'border-slate-700/50 bg-slate-800/30 hover:bg-slate-800/60' };
+                  const badgeMap = { red: 'bg-red-500/20 text-red-400', amber: 'bg-amber-500/20 text-amber-400', green: 'bg-green-500/20 text-green-400', blue: 'bg-blue-500/20 text-blue-400', slate: 'bg-slate-700 text-slate-400' };
                   const d = new Date(log.timestamp);
-                  const timeStr = d.toLocaleTimeString('th-TH', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
-                  const dateStr = d.toLocaleDateString('th-TH', { day:'numeric', month:'short', year:'2-digit' });
+                  const timeStr = d.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                  const dateStr = d.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' });
                   return (
-                    <div key={String(log.timestamp)+i} className={cn("flex items-start gap-4 p-4 rounded-xl border transition-colors", colorMap[cfg.color]||colorMap.slate)}>
-                      <div className="text-2xl leading-none mt-0.5 shrink-0">{cfg.icon}</div>
+                    <div key={String(log.timestamp) + i} className={cn("flex items-start gap-4 p-4 rounded-xl border transition-colors", colorMap[cfg.color] || colorMap.slate)}>
+                      <div className={cn("shrink-0 p-2 rounded-lg", badgeMap[cfg.color] || badgeMap.slate)}>
+                        {log.type === 'FALL_DETECTED' && <ShieldAlert size={18} />}
+                        {log.type === 'ACKNOWLEDGED' && <CheckCircle size={18} />}
+                        {log.type === 'RESOLVED' && <Stethoscope size={18} />}
+                        {log.type === 'DEVICE_CHANGE' && <Wifi size={18} />}
+                        {log.type === 'MUTE' && <VolumeX size={18} />}
+                        {log.type === 'UNMUTE' && <Volume2 size={18} />}
+                        {log.type === 'SYSTEM' && <Activity size={18} />}
+                      </div>
                       <div className="flex-1 min-w-0">
                         <div className="flex flex-wrap items-center gap-2 mb-1">
-                          <span className={cn("text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full", badgeMap[cfg.color]||badgeMap.slate)}>{cfg.label}</span>
-                          {log.meta?.wardKey && <span className="text-[11px] text-slate-500 font-mono">{String(log.meta.wardKey).replace('ward_','Ward ')} / {String(log.meta.roomKey||'').replace('room_','Room ')}</span>}
+                          <span className={cn("text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full", badgeMap[cfg.color] || badgeMap.slate)}>{cfg.label}</span>
+                          {log.meta?.wardKey && <span className="text-[11px] text-slate-500 font-mono">{String(log.meta.wardKey).replace('ward_', 'Ward ')} / {String(log.meta.roomKey || '').replace('room_', 'Room ')}</span>}
                         </div>
                         <p className="text-sm text-slate-300 break-words">{log.message}</p>
                       </div>
